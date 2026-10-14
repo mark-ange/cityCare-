@@ -1,0 +1,25 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Local credentials and generated files
+.env
+.env.*
+!.env.example
+!**/.env.example
+**/google-services.json
+**/serviceAccountKey.json
+*.jks
+*.keystore
+node_modules/
+dist/
+app/build/
+backend/node_modules/
