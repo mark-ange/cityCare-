@@ -12,11 +12,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.activity.SystemBarStyle
@@ -37,10 +37,15 @@ class MainActivity : AppCompatActivity() {
         actionBar?.hide()
 
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            statusBarStyle = SystemBarStyle.light(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            ),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
-        WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false
+        WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = true
+
+        val hasSavedSession = CityCareApiService.loadUserSession(this)
 
         setContent {
             MaterialTheme {
@@ -51,12 +56,10 @@ class MainActivity : AppCompatActivity() {
                 // 2 = Profile Picture Setup Screen
                 // 3 = Reset Password Screen
                 // 4 = Main Dashboard Screen
-                var currentScreen by remember { mutableIntStateOf(0) }
-                var showExitDialog by remember { mutableStateOf(false) }
-
-                LaunchedEffect(Unit) {
-                    CityCareApiService.clearUserSession(context)
+                var currentScreen by rememberSaveable {
+                    mutableIntStateOf(if (hasSavedSession) 4 else 0)
                 }
+                var showExitDialog by remember { mutableStateOf(false) }
 
                 // ATTACH DIRECT SYSTEM BACK BUTTON & BACK GESTURE CALLBACK
                 DisposableEffect(currentScreen) {

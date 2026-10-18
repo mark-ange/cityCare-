@@ -231,45 +231,29 @@ fun CityCareLoginScreen(
                 object : FacebookCallback<LoginResult> {
                     override fun onSuccess(result: LoginResult) {
                         isAuthenticatingSocial = true
-                        val request = com.facebook.GraphRequest.newMeRequest(result.accessToken) { objectJson, _ ->
-                            val fbEmail = objectJson?.optString("email")?.takeIf { it.isNotBlank() }
-                                ?: "fb_user_${result.accessToken.userId}@citycare.ph"
-                            val fbName = objectJson?.optString("name")?.takeIf { it.isNotBlank() }
-                                ?: "Facebook Resident"
-                            val fbPhoto = objectJson?.optJSONObject("picture")?.optJSONObject("data")?.optString("url")
-
-                            coroutineScope.launch {
-                                val success = CityCareApiService.loginWithGoogleSocial(fbEmail, fbName, fbPhoto)
-                                isAuthenticatingSocial = false
-                                if (success) {
-                                    onLoginSuccess()
-                                } else {
-                                    errorMessage = "Facebook Login succeeded, but backend verification failed."
-                                }
-                            }
-                        }
-                        val parameters = android.os.Bundle()
-                        parameters.putString("fields", "id,name,email,picture.type(large)")
-                        request.parameters = parameters
-                        request.executeAsync()
-                    }
-
-                    override fun onCancel() {
-                        errorMessage = "Facebook Sign-In canceled."
-                    }
-
-                    override fun onError(error: FacebookException) {
-                        val msg = error.localizedMessage ?: "Unknown Facebook Error"
-                        isAuthenticatingSocial = true
                         coroutineScope.launch {
-                            val success = CityCareApiService.loginWithGoogleSocial("facebook_resident@citycare.ph", "Facebook Resident")
+                            val (success, message) = CityCareApiService.loginWithFacebookAccessToken(
+                                accessToken = result.accessToken.token,
+                                context = context
+                            )
                             isAuthenticatingSocial = false
                             if (success) {
                                 onLoginSuccess()
                             } else {
-                                errorMessage = "Facebook Sign-In Error: $msg"
+                                errorMessage = message
                             }
                         }
+                    }
+
+                    override fun onCancel() {
+                        isAuthenticatingSocial = false
+                        errorMessage = "Facebook Sign-In canceled."
+                    }
+
+                    override fun onError(error: FacebookException) {
+                        isAuthenticatingSocial = false
+                        errorMessage = error.localizedMessage?.let { "Facebook Sign-In Error: $it" }
+                            ?: "Facebook sign-in failed. Please try again."
                     }
                 }
             )
@@ -331,21 +315,25 @@ fun CityCareLoginScreen(
                         Spacer(modifier = Modifier.height(6.dp))
 
                         Text(
-                            text = "Let's get started",
+                            text = if (selectedTab == 0) "CityCare CDO Resident Portal" else "Join CityCare CDO",
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Medium,
                             color = Color(0xFF80ED99)
                         )
 
                         Text(
-                            text = if (selectedTab == 0) "Welcome Back" else "Create Resident Account",
+                            text = if (selectedTab == 0) "Sign In to CityCare" else "Create Resident Account",
                             fontSize = 24.sp,
                             fontWeight = FontWeight.ExtraBold,
                             color = Color.White
                         )
 
                         Text(
-                            text = "We are here to help our environment through proper waste management & recycling.",
+                            text = if (selectedTab == 0) {
+                                "Access your resident account to report concerns, track garbage collection, and earn eco points."
+                            } else {
+                                "Sign up to report waste issues, stay updated with CLENRO collection schedules, and help our environment."
+                            },
                             fontSize = 12.sp,
                             color = Color(0xFFE2E8F0),
                             lineHeight = 16.sp
@@ -613,23 +601,27 @@ fun CityCareLoginScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                                    if (facebookLauncher != null) {
-                                        OutlinedButton(
-                                            onClick = {
-                                                errorMessage = null
+                                    OutlinedButton(
+                                        onClick = {
+                                            errorMessage = null
+                                            if (facebookLauncher == null) {
+                                                errorMessage = "Facebook sign-in is not configured. Add the Facebook App ID and Client Token to your Gradle properties, then rebuild."
+                                            } else if (!isAuthenticatingSocial) {
+                                                isAuthenticatingSocial = true
                                                 facebookLauncher.launch(listOf("email", "public_profile"))
-                                            },
-                                            modifier = Modifier.height(44.dp),
-                                            shape = RoundedCornerShape(10.dp),
-                                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFCBD5E1))
-                                        ) {
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                            ) {
-                                                FacebookLogoIcon(modifier = Modifier.size(20.dp))
-                                                Text("Facebook", fontSize = 12.sp, color = EcoAuthTextDark, fontWeight = FontWeight.Bold)
                                             }
+                                        },
+                                        enabled = !isAuthenticatingSocial,
+                                        modifier = Modifier.height(44.dp),
+                                        shape = RoundedCornerShape(10.dp),
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFCBD5E1))
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            FacebookLogoIcon(modifier = Modifier.size(20.dp))
+                                            Text("Facebook", fontSize = 12.sp, color = EcoAuthTextDark, fontWeight = FontWeight.Bold)
                                         }
                                     }
 
@@ -702,24 +694,7 @@ fun CityCareLoginScreen(
                                 }
 
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(text = "Phone Number", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = EcoAuthTextMuted)
-                                    OutlinedTextField(
-                                        value = regPhoneNumber,
-                                        onValueChange = {
-                                            regPhoneNumber = it
-                                            errorMessage = null
-                                        },
-                                        placeholder = { Text("0912 345 6789", fontSize = 12.sp, color = EcoAuthTextMuted) },
-                                        modifier = Modifier.fillMaxWidth(),
-                                        singleLine = true,
-                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                                        shape = RoundedCornerShape(8.dp),
-                                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = EcoAuthGreen, unfocusedBorderColor = Color(0xFFCBD5E1))
-                                    )
-                                }
-
-                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(text = "Email Address / Gmail (Optional)", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = EcoAuthTextMuted)
+                                    Text(text = "Email Address / Gmail", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = EcoAuthTextMuted)
                                     OutlinedTextField(
                                         value = regEmailOptional,
                                         onValueChange = {
@@ -730,6 +705,23 @@ fun CityCareLoginScreen(
                                         modifier = Modifier.fillMaxWidth(),
                                         singleLine = true,
                                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next),
+                                        shape = RoundedCornerShape(8.dp),
+                                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = EcoAuthGreen, unfocusedBorderColor = Color(0xFFCBD5E1))
+                                    )
+                                }
+
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(text = "Phone Number (Optional)", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = EcoAuthTextMuted)
+                                    OutlinedTextField(
+                                        value = regPhoneNumber,
+                                        onValueChange = {
+                                            regPhoneNumber = it
+                                            errorMessage = null
+                                        },
+                                        placeholder = { Text("0912 345 6789", fontSize = 12.sp, color = EcoAuthTextMuted) },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        singleLine = true,
+                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                                         shape = RoundedCornerShape(8.dp),
                                         colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = EcoAuthGreen, unfocusedBorderColor = Color(0xFFCBD5E1))
                                     )
@@ -799,14 +791,14 @@ fun CityCareLoginScreen(
                                 )
 
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(text = "Password", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = EcoAuthTextMuted)
+                                    Text(text = "Password (min. 6 chars, 1 uppercase, 1 symbol)", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = EcoAuthTextMuted)
                                     OutlinedTextField(
                                         value = regPassword,
                                         onValueChange = {
                                             regPassword = it
                                             errorMessage = null
                                         },
-                                        placeholder = { Text("••••••••", fontSize = 12.sp, color = EcoAuthTextMuted) },
+                                        placeholder = { Text("e.g. Mark1234!", fontSize = 12.sp, color = EcoAuthTextMuted) },
                                         modifier = Modifier.fillMaxWidth(),
                                         singleLine = true,
                                         visualTransformation = PasswordVisualTransformation(),
@@ -824,7 +816,7 @@ fun CityCareLoginScreen(
                                             regConfirmPassword = it
                                             errorMessage = null
                                         },
-                                        placeholder = { Text("••••••••", fontSize = 12.sp, color = EcoAuthTextMuted) },
+                                        placeholder = { Text("e.g. Mark1234!", fontSize = 12.sp, color = EcoAuthTextMuted) },
                                         modifier = Modifier.fillMaxWidth(),
                                         singleLine = true,
                                         visualTransformation = PasswordVisualTransformation(),
@@ -858,10 +850,15 @@ fun CityCareLoginScreen(
                                         val cleanEmail = regEmailOptional.trim()
                                         val cleanPass = regPassword.trim()
 
+                                        val hasUppercase = cleanPass.any { it.isUpperCase() }
+                                        val hasSpecialChar = cleanPass.any { !it.isLetterOrDigit() }
+
                                         when {
                                             cleanName.isEmpty() -> errorMessage = "Please enter your Full Name!"
-                                            cleanPhone.isEmpty() && cleanEmail.isEmpty() -> errorMessage = "Please enter your Phone Number or Email address!"
+                                            cleanEmail.isEmpty() -> errorMessage = "Please enter your Email address / Gmail!"
                                             cleanPass.length < 6 -> errorMessage = "Password must be at least 6 characters long!"
+                                            !hasUppercase -> errorMessage = "Password must contain at least one uppercase letter (e.g. Mark1234!)."
+                                            !hasSpecialChar -> errorMessage = "Password must contain at least one special character (e.g. Mark1234!)."
                                             cleanPass != regConfirmPassword.trim() -> errorMessage = "Passwords do not match!"
                                             !regAgreeTerms -> errorMessage = "Please agree to the Terms of Service and Privacy Policy!"
                                             else -> {
@@ -870,7 +867,7 @@ fun CityCareLoginScreen(
                                                 val account = CitizenAccount(
                                                     name = cleanName,
                                                     purok = regPurokZone.ifEmpty { "Zone 3" },
-                                                    identifier = cleanPhone.ifEmpty { cleanEmail },
+                                                    identifier = cleanEmail,
                                                     password = cleanPass,
                                                     email = cleanEmail,
                                                     phoneNumber = cleanPhone,

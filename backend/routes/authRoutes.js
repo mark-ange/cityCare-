@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const User = require('../models/User');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -71,6 +72,7 @@ router.post('/register-resident', async (req, res) => {
           email: user.email,
           barangay: user.barangay,
           purokZone: user.purokZone,
+          profilePhoto: user.profilePhoto,
           role: user.role,
           ecoPoints: user.ecoPoints,
           createdAt: user.createdAt
@@ -145,6 +147,7 @@ router.post('/login', async (req, res) => {
           email: user.email,
           barangay: user.barangay,
           purokZone: user.purokZone,
+          profilePhoto: user.profilePhoto,
           role: user.role,
           ecoPoints: user.ecoPoints
         }
@@ -160,6 +163,84 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/facebook', async (req, res) => {
+  try {
+    const { accessToken } = req.body;
+    const appId = process.env.FACEBOOK_APP_ID;
+    const appSecret = process.env.FACEBOOK_APP_SECRET;
+    if (!appId || !appSecret) {
+      return res.status(503).json({
+        success: false,
+        message: 'Facebook sign-in is not configured on the server.'
+      });
+    }
+    if (typeof accessToken !== 'string' || !accessToken.trim()) {
+      return res.status(400).json({ success: false, message: 'Facebook access token is required.' });
+    }
+
+    const debugUrl = new URL('https://graph.facebook.com/debug_token');
+    debugUrl.searchParams.set('input_token', accessToken);
+    debugUrl.searchParams.set('access_token', `${appId}|${appSecret}`);
+    const debugResponse = await fetch(debugUrl);
+    const debugBody = await debugResponse.json();
+    const tokenData = debugBody.data;
+
+    if (!debugResponse.ok || !tokenData?.is_valid || tokenData.app_id !== appId) {
+      return res.status(401).json({ success: false, message: 'Facebook access token is invalid.' });
+    }
+
+    const profileUrl = new URL('https://graph.facebook.com/me');
+    profileUrl.searchParams.set('fields', 'id,name,email');
+    profileUrl.searchParams.set('access_token', accessToken);
+    const profileResponse = await fetch(profileUrl);
+    const profile = await profileResponse.json();
+    if (!profileResponse.ok || !profile.id || profile.id !== tokenData.user_id) {
+      return res.status(401).json({ success: false, message: 'Could not verify the Facebook account.' });
+    }
+
+    const email = typeof profile.email === 'string' ? profile.email.trim().toLowerCase() : '';
+    let user = await User.findOne({ facebookId: profile.id });
+    if (!user && email) {
+      user = await User.findOne({ email });
+      if (user) user.facebookId = profile.id;
+    }
+
+    if (!user) {
+      user = new User({
+        fullName: profile.name || 'Facebook Resident',
+        phoneNumber: `FB-${profile.id}`,
+        email: email || `facebook_${profile.id}@facebook.citycare.invalid`,
+        facebookId: profile.id,
+        password: crypto.randomBytes(32).toString('hex'),
+        role: 'resident'
+      });
+    } else if (!user.facebookId) {
+      user.facebookId = profile.id;
+    }
+
+    await user.save();
+    return res.json({
+      success: true,
+      message: 'Facebook sign-in successful.',
+      token: generateToken(user._id),
+      data: {
+        _id: user._id,
+        fullName: user.fullName,
+        phoneNumber: user.phoneNumber,
+        email: user.email,
+        barangay: user.barangay,
+        purokZone: user.purokZone,
+        profilePhoto: user.profilePhoto,
+        role: user.role,
+        ecoPoints: user.ecoPoints
+      }
+    });
+  } catch (error) {
+    console.error('Facebook Sign-In Error:', error);
+    return res.status(500).json({ success: false, message: 'Facebook sign-in failed.' });
+  }
+});
+
 // @route   GET /api/auth/profile
 // @desc    Get user profile
 // @access  Private
@@ -172,6 +253,91 @@ router.get('/profile', protect, async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
   } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.put('/profile', protect, async (req, res) => {
+  try {
+    const { fullName, phoneNumber, email, barangay, purokZone, profilePhoto } = req.body;
+    const updates = {};
+
+    if (fullName !== undefined) {
+      if (!fullName.trim()) {
+        return res.status(400).json({ success: false, message: 'Full name is required.' });
+      }
+      updates.fullName = fullName.trim();
+    }
+
+    if (phoneNumber !== undefined) {
+      if (!phoneNumber.trim()) {
+        return res.status(400).json({ success: false, message: 'Phone number is required.' });
+      }
+      const duplicatePhone = await User.findOne({
+        phoneNumber: phoneNumber.trim(),
+        _id: { $ne: req.user._id }
+      });
+      if (duplicatePhone) {
+        return res.status(409).json({ success: false, message: 'That phone number is already in use.' });
+      }
+      updates.phoneNumber = phoneNumber.trim();
+    }
+
+    if (email !== undefined) {
+      const cleanEmail = email.trim().toLowerCase();
+      if (cleanEmail) {
+        const duplicateEmail = await User.findOne({
+          email: cleanEmail,
+          _id: { $ne: req.user._id }
+        });
+        if (duplicateEmail) {
+          return res.status(409).json({ success: false, message: 'That email address is already in use.' });
+        }
+      }
+      updates.email = cleanEmail;
+    }
+
+    if (barangay !== undefined) updates.barangay = barangay.trim();
+    if (purokZone !== undefined) updates.purokZone = purokZone.trim();
+    if (profilePhoto !== undefined) updates.profilePhoto = profilePhoto;
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: updates },
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    return res.json({ success: true, data: user });
+  } catch (error) {
+    console.error('Profile Update Error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.put('/change-password', protect, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword || newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Enter your current password and a new password with at least 6 characters.'
+      });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user || !(await user.matchPassword(currentPassword))) {
+      return res.status(400).json({ success: false, message: 'Current password is incorrect.' });
+    }
+
+    user.password = newPassword;
+    await user.save();
+    return res.json({ success: true, message: 'Password changed successfully.' });
+  } catch (error) {
+    console.error('Password Change Error:', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 });

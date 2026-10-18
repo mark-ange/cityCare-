@@ -34,22 +34,22 @@ router.get('/', async (req, res) => {
     const { barangay } = req.query;
     let schedules = [];
 
-    try {
+    const escapedBarangay = typeof barangay === 'string'
+      ? barangay.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      : '';
+    const filter = escapedBarangay
+      ? { barangay: { $regex: `^${escapedBarangay}$`, $options: 'i' } }
+      : {};
+    const storedScheduleCount = await Schedule.countDocuments();
+    if (storedScheduleCount > 0) {
+      schedules = await Schedule.find(filter).sort({ barangay: 1 });
+    } else {
       if (barangay) {
-        schedules = await Schedule.find({ barangay: new RegExp(barangay, 'i') });
+        schedules = mockSchedules.filter(
+          s => s.barangay.toLowerCase() === String(barangay).trim().toLowerCase()
+        );
       } else {
-        schedules = await Schedule.find();
-      }
-    } catch (err) {
-      // DB error fallback
-    }
-
-    if (schedules.length === 0) {
-      if (barangay) {
-        schedules = mockSchedules.filter(s => s.barangay.toLowerCase() === barangay.toLowerCase());
-        if (schedules.length === 0) schedules = [mockSchedules[0]];
-      } else {
-        schedules = mockSchedules;
+        schedules = [...mockSchedules].sort((a, b) => a.barangay.localeCompare(b.barangay));
       }
     }
 

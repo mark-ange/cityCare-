@@ -57,13 +57,19 @@ import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.MarkerState
 import com.google.maps.android.compose.rememberCameraPositionState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 // Color Palette matching Eco UI Design
 val EcoHeaderDark = Color(0xFF0F382C)
@@ -87,13 +93,44 @@ val DashboardTextDark = EcoTextDark
 val DashboardTextMuted = EcoTextMuted
 val DashboardHomeTabYellow = EcoHomeTabYellow
 
+private fun normalizedAreaName(value: String): String =
+    value.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9]+"), " ").trim()
+
+private fun findMatchingAreaSchedule(
+    schedule: CityCareCollectionSchedule?,
+    residentArea: String
+): CityCareAreaCollectionSchedule? {
+    val normalizedResidentArea = normalizedAreaName(residentArea)
+    if (schedule == null) return null
+    if (normalizedResidentArea.isBlank()) {
+        return schedule.areaSchedules.firstOrNull { it.appliesToAllAreas }
+    }
+
+    val paddedResidentArea = " $normalizedResidentArea "
+    val exactMatch = schedule.areaSchedules
+        .filter { area ->
+            if (area.appliesToAllAreas) return@filter false
+            val normalizedScheduleArea = normalizedAreaName(area.areaName)
+            normalizedScheduleArea.isNotBlank() &&
+                paddedResidentArea.contains(" $normalizedScheduleArea ")
+        }
+        .maxByOrNull { normalizedAreaName(it.areaName).length }
+    return exactMatch ?: schedule.areaSchedules.firstOrNull {
+        it.appliesToAllAreas
+    }
+}
+
 enum class DashboardSubScreen {
     Main,
     NewReport,
     TicketDetails,
     Notifications,
+    CollectionSchedule,
+    CommunityContent,
     Tips,
-    Profile
+    Profile,
+    Support,
+    MoreDetails
 }
 
 data class ActionGridItem(
@@ -142,16 +179,20 @@ fun CityCareDashboardScreen(
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val coroutineScope = rememberCoroutineScope()
-    var selectedTab by rememberSaveable { mutableIntStateOf(0) } // 0: Home, 1: Reports, 2: Support, 3: More
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) } // 0: Home, 1: Reports, 2: More
     var currentSubScreen by rememberSaveable { mutableStateOf(DashboardSubScreen.Main) }
+    var selectedMoreItem by rememberSaveable { mutableStateOf<String>("") }
+    var reportStatusFilter by rememberSaveable { mutableStateOf("ALL") }
     var showExitDialog by remember { mutableStateOf(false) }
+    var webViewBackHandler by remember { mutableStateOf<(() -> Boolean)?>(null) }
 
     // Register Back Navigation Handler with parent Activity
     DisposableEffect(currentSubScreen, selectedTab) {
         onRegisterBackHandler {
             when {
                 currentSubScreen != DashboardSubScreen.Main -> {
-                    currentSubScreen = DashboardSubScreen.Main
+                    val handledByWebView = webViewBackHandler?.invoke() ?: false
+                    if (!handledByWebView) currentSubScreen = DashboardSubScreen.Main
                     true
                 }
                 selectedTab != 0 -> {
@@ -169,7 +210,7 @@ fun CityCareDashboardScreen(
     }
 
     // Quick Services Grid state & modals
-    var selectedGridFeature by remember { mutableStateOf<String?>(null) }
+    var selectedCommunityContentType by rememberSaveable { mutableStateOf("recycle") }
     var showReportDialog by remember { mutableStateOf(false) }
     var showReportSuccessModal by remember { mutableStateOf(false) }
     var capturedPhotoBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -238,15 +279,16 @@ fun CityCareDashboardScreen(
             ActionGridItem("Recycle", Icons.Outlined.Autorenew, Color(0xFF16A34A)),
             ActionGridItem("Events", Icons.Outlined.Event, Color(0xFFA855F7)),
             ActionGridItem("Tips", Icons.Outlined.Lightbulb, Color(0xFFEAB308)),
-            ActionGridItem("Blog", Icons.AutoMirrored.Outlined.Article, Color(0xFF0284C7)),
-            ActionGridItem("Donate", Icons.Outlined.FavoriteBorder, Color(0xFFEC4899))
+            ActionGridItem("Blog", Icons.AutoMirrored.Outlined.Article, Color(0xFF0284C7))
         )
     }
 
     Scaffold(
         containerColor = Color(0xFFF8FAFC),
         bottomBar = {
-            if (currentSubScreen == DashboardSubScreen.Main) {
+            if (currentSubScreen == DashboardSubScreen.Main ||
+                currentSubScreen == DashboardSubScreen.Notifications
+            ) {
                 // Elevated Center Floating Camera FAB Bottom Navigation Bar
                 Box(
                     modifier = Modifier.fillMaxWidth(),
@@ -273,7 +315,11 @@ fun CityCareDashboardScreen(
                                 activeIcon = Icons.Default.Home,
                                 inactiveIcon = Icons.Outlined.Home,
                                 isSelected = selectedTab == 0,
-                                onClick = { selectedTab = 0 }
+                                onClick = {
+                                    currentSubScreen = DashboardSubScreen.Main
+                                    selectedTab = 0
+                                },
+                                modifier = Modifier.weight(1f)
                             )
 
                             // 2. Reports Tab
@@ -282,28 +328,35 @@ fun CityCareDashboardScreen(
                                 activeIcon = Icons.AutoMirrored.Filled.Assignment,
                                 inactiveIcon = Icons.AutoMirrored.Outlined.Assignment,
                                 isSelected = selectedTab == 1,
-                                onClick = { selectedTab = 1 }
+                                onClick = {
+                                    currentSubScreen = DashboardSubScreen.Main
+                                    selectedTab = 1
+                                },
+                                modifier = Modifier.weight(1f)
                             )
 
-                            // Center Spacer for Floating Camera Button
-                            Spacer(modifier = Modifier.width(56.dp))
+                            Spacer(modifier = Modifier.weight(1f))
 
-                            // 3. Support Tab
                             NavTabItemComposable(
-                                label = "Support",
-                                activeIcon = Icons.Default.HeadsetMic,
-                                inactiveIcon = Icons.Outlined.HeadsetMic,
-                                isSelected = selectedTab == 2,
-                                onClick = { selectedTab = 2 }
+                                label = "Notification",
+                                activeIcon = Icons.Default.Notifications,
+                                inactiveIcon = Icons.Outlined.Notifications,
+                                isSelected = currentSubScreen == DashboardSubScreen.Notifications,
+                                onClick = { currentSubScreen = DashboardSubScreen.Notifications },
+                                modifier = Modifier.weight(1f)
                             )
 
-                            // 4. More Tab
+                            // More Tab
                             NavTabItemComposable(
                                 label = "More",
                                 activeIcon = Icons.Default.MoreHoriz,
                                 inactiveIcon = Icons.Outlined.MoreHoriz,
-                                isSelected = selectedTab == 3,
-                                onClick = { selectedTab = 3 }
+                                isSelected = selectedTab == 2,
+                                onClick = {
+                                    currentSubScreen = DashboardSubScreen.Main
+                                    selectedTab = 2
+                                },
+                                modifier = Modifier.weight(1f)
                             )
                         }
                     }
@@ -364,17 +417,47 @@ fun CityCareDashboardScreen(
                     )
                 }
 
-                DashboardSubScreen.Tips -> {
-                    TipsScreen(
+                DashboardSubScreen.CollectionSchedule -> {
+                    CollectionScheduleScreen(
                         onBack = { currentSubScreen = DashboardSubScreen.Main }
+                    )
+                }
+
+                DashboardSubScreen.CommunityContent -> {
+                    CommunityContentScreen(
+                        contentType = selectedCommunityContentType,
+                        onBack = { currentSubScreen = DashboardSubScreen.Main },
+                        onRegisterWebViewBackHandler = { handler -> webViewBackHandler = handler }
+                    )
+                }
+
+                DashboardSubScreen.Tips -> {
+                    CommunityContentScreen(
+                        contentType = "tip",
+                        onBack = { currentSubScreen = DashboardSubScreen.Main },
+                        onRegisterWebViewBackHandler = { handler -> webViewBackHandler = handler }
                     )
                 }
 
                 DashboardSubScreen.Profile -> {
                     ProfileScreenContent(
                         onBack = { currentSubScreen = DashboardSubScreen.Main },
-                        onOpenNotifications = { currentSubScreen = DashboardSubScreen.Notifications },
                         onLogout = onLogout
+                    )
+                }
+
+                DashboardSubScreen.Support -> {
+                    SupportScreenContent(
+                        onBack = { currentSubScreen = DashboardSubScreen.Main },
+                        onOpenNotifications = { currentSubScreen = DashboardSubScreen.Notifications },
+                        onSelectReport = { report -> openReportDetails(report) }
+                    )
+                }
+
+                DashboardSubScreen.MoreDetails -> {
+                    MoreSettingsDetailScreen(
+                        title = selectedMoreItem.ifBlank { "Settings" },
+                        onBack = { currentSubScreen = DashboardSubScreen.Main }
                     )
                 }
 
@@ -384,60 +467,59 @@ fun CityCareDashboardScreen(
                             actionGridList = actionGridList,
                             reports = reportList,
                             onSelectGridFeature = { featureTitle ->
-                                if (featureTitle == "Tips") {
-                                    currentSubScreen = DashboardSubScreen.Tips
-                                } else {
-                                    selectedGridFeature = featureTitle
+                                when (featureTitle) {
+                                    "Tips" -> currentSubScreen = DashboardSubScreen.Tips
+                                    "Schedule" -> currentSubScreen = DashboardSubScreen.CollectionSchedule
+                                    "Recycle" -> {
+                                        selectedCommunityContentType = "recycle"
+                                        currentSubScreen = DashboardSubScreen.CommunityContent
+                                    }
+                                    "Events" -> {
+                                        selectedCommunityContentType = "event"
+                                        currentSubScreen = DashboardSubScreen.CommunityContent
+                                    }
+                                    "Blog" -> {
+                                        selectedCommunityContentType = "blog"
+                                        currentSubScreen = DashboardSubScreen.CommunityContent
+                                    }
                                 }
                             },
                             onOpenNewReport = { currentSubScreen = DashboardSubScreen.NewReport },
-                            onOpenNotifications = { currentSubScreen = DashboardSubScreen.Notifications },
                             onOpenProfile = { currentSubScreen = DashboardSubScreen.Profile },
                             onSelectReport = { report ->
                                 openReportDetails(report)
                             },
-                            onViewAllReports = { selectedTab = 1 }
+                            onViewAllReports = {
+                                reportStatusFilter = "ALL"
+                                selectedTab = 1
+                            },
+                            onViewReportsByStatus = { status ->
+                                reportStatusFilter = status
+                                selectedTab = 1
+                            }
                         )
 
                         1 -> MyReportsScreenContent(
                             reports = reportList,
-                            onOpenNotifications = { currentSubScreen = DashboardSubScreen.Notifications },
+                            initialStatusFilter = reportStatusFilter,
                             onOpenProfile = { currentSubScreen = DashboardSubScreen.Profile },
                             onSelectReport = { report ->
                                 openReportDetails(report)
                             }
                         )
 
-                        2 -> SupportScreenContent(
-                            onOpenNotifications = { currentSubScreen = DashboardSubScreen.Notifications },
-                            onOpenNewTicket = { currentSubScreen = DashboardSubScreen.NewReport },
-                            onSelectReport = { report ->
-                                openReportDetails(report)
+                        2 -> MoreScreenContent(
+                            onOpenProfile = { currentSubScreen = DashboardSubScreen.Profile },
+                            onOpenSupport = { currentSubScreen = DashboardSubScreen.Support },
+                            onOpenItem = { item ->
+                                selectedMoreItem = item
+                                currentSubScreen = DashboardSubScreen.MoreDetails
                             }
-                        )
-
-                        3 -> MoreScreenContent(
-                            onOpenNotifications = { currentSubScreen = DashboardSubScreen.Notifications },
-                            onOpenTips = { currentSubScreen = DashboardSubScreen.Tips }
                         )
                     }
                 }
             }
         }
-    }
-
-    // Modal Dialog when Quick Action Feature is clicked
-    selectedGridFeature?.let { featureName ->
-        AlertDialog(
-            onDismissRequest = { selectedGridFeature = null },
-            title = { Text(featureName, fontWeight = FontWeight.Bold) },
-            text = { Text("Viewing $featureName for ${CityCareApiService.currentUserLocation}.") },
-            confirmButton = {
-                TextButton(onClick = { selectedGridFeature = null }) {
-                    Text("Close", fontWeight = FontWeight.Bold)
-                }
-            }
-        )
     }
 
     if (showExitDialog) {
@@ -500,14 +582,41 @@ fun HomeScreenContent(
     reports: List<WasteReportItem>,
     onSelectGridFeature: (String) -> Unit,
     onOpenNewReport: () -> Unit,
-    onOpenNotifications: () -> Unit,
     onOpenProfile: () -> Unit,
     onSelectReport: (WasteReportItem) -> Unit,
-    onViewAllReports: () -> Unit
+    onViewAllReports: () -> Unit,
+    onViewReportsByStatus: (String) -> Unit = {}
 ) {
-    val pendingCount = reports.count { it.status == "PENDING" }
-    val assignedCount = reports.count { it.status == "ASSIGNED" }
-    val doneCount = reports.count { it.status == "RESOLVED" || it.status == "DONE" }
+    fun normalizedStatus(report: WasteReportItem) =
+        report.status.uppercase().replace('-', '_').replace(' ', '_')
+
+    val pendingCount = reports.count { normalizedStatus(it) == "PENDING" }
+    val assignedCount = reports.count { normalizedStatus(it) == "ASSIGNED" }
+    val doneCount = reports.count { normalizedStatus(it) in setOf("RESOLVED", "DONE", "COMPLETED") }
+    var residentSchedule by remember { mutableStateOf<CityCareCollectionSchedule?>(null) }
+    var residentAreaSchedule by remember { mutableStateOf<CityCareAreaCollectionSchedule?>(null) }
+    var isLoadingResidentSchedule by remember { mutableStateOf(true) }
+    var residentScheduleUnavailable by remember { mutableStateOf(false) }
+
+    LaunchedEffect(CityCareApiService.currentUserBarangay, CityCareApiService.currentUserPurok) {
+        isLoadingResidentSchedule = true
+        residentScheduleUnavailable = false
+        try {
+            residentSchedule = CityCareApiService
+                .fetchSchedulesFromCloud(CityCareApiService.currentUserBarangay)
+                .firstOrNull()
+            residentAreaSchedule = findMatchingAreaSchedule(
+                residentSchedule,
+                CityCareApiService.currentUserPurok
+            )
+        } catch (error: Exception) {
+            residentSchedule = null
+            residentAreaSchedule = null
+            residentScheduleUnavailable = true
+        } finally {
+            isLoadingResidentSchedule = false
+        }
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -567,31 +676,6 @@ fun HomeScreenContent(
                             }
                         }
 
-                        // Notification Bell
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(CircleShape)
-                                .background(Color.White)
-                                .clickable { onOpenNotifications() },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Notifications,
-                                contentDescription = "Notifications",
-                                tint = EcoHeaderDark,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Box(
-                                modifier = Modifier
-                                    .padding(top = 6.dp, end = 6.dp)
-                                    .size(9.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFFEF4444))
-                                    .border(1.5.dp, Color.White, CircleShape)
-                                    .align(Alignment.TopEnd)
-                            )
-                        }
                     }
 
                     // Eco Impact & eWaste Stats Card
@@ -671,14 +755,37 @@ fun HomeScreenContent(
 
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "CLENRO Collection Schedule:",
+                                text = if (residentAreaSchedule?.isSample == true) {
+                                    "SAMPLE schedule — not official:"
+                                } else {
+                                    "CLENRO Collection Schedule:"
+                                },
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = EcoTextDark
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "MWF - Biodegradable\nTTHS - Non-Bio",
+                                text = when {
+                                    isLoadingResidentSchedule -> "Loading schedule..."
+                                    residentScheduleUnavailable -> "Schedule is currently unavailable."
+                                    residentSchedule == null -> "No schedule published for ${CityCareApiService.currentUserBarangay}."
+                                    CityCareApiService.currentUserPurok.isBlank() &&
+                                        residentAreaSchedule?.appliesToAllAreas != true ->
+                                        "Add your purok, zone, or street in your profile to find its collection route."
+                                    residentAreaSchedule == null ->
+                                        "No area-specific schedule is published for ${CityCareApiService.currentUserPurok}."
+                                    else -> buildString {
+                                        if (residentAreaSchedule?.isSample == true) {
+                                            append("SAMPLE ONLY — not an official CLENRO schedule.\n")
+                                        }
+                                        append("Area: ${residentAreaSchedule?.areaName.orEmpty()}")
+                                        append("\nBiodegradable: ${residentAreaSchedule?.biodegradableDays.orEmpty()}")
+                                        append("\nNon-biodegradable: ${residentAreaSchedule?.nonBiodegradableDays.orEmpty()}")
+                                        append("\nTime: ${residentAreaSchedule?.timeSlot.orEmpty()}")
+                                        append("\nTruck: ${residentAreaSchedule?.assignedTruck.orEmpty()}")
+                                    }
+                                },
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = EcoTextMuted,
@@ -701,6 +808,7 @@ fun HomeScreenContent(
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Card(
+                        onClick = { onViewReportsByStatus("PENDING") },
                         shape = RoundedCornerShape(12.dp),
                         colors = CardDefaults.cardColors(containerColor = Color.White),
                         border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
@@ -728,6 +836,7 @@ fun HomeScreenContent(
                     }
 
                     Card(
+                        onClick = { onViewReportsByStatus("ASSIGNED") },
                         shape = RoundedCornerShape(12.dp),
                         colors = CardDefaults.cardColors(containerColor = Color.White),
                         border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
@@ -755,6 +864,7 @@ fun HomeScreenContent(
                     }
 
                     Card(
+                        onClick = { onViewReportsByStatus("DONE") },
                         shape = RoundedCornerShape(12.dp),
                         colors = CardDefaults.cardColors(containerColor = Color.White),
                         border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
@@ -795,82 +905,20 @@ fun HomeScreenContent(
                     )
 
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        actionGridList.chunked(3).forEach { rowItems ->
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            for (i in 0..2) {
-                                if (i < actionGridList.size) {
-                                    val item = actionGridList[i]
-                                    Card(
-                                        onClick = { onSelectGridFeature(item.title) },
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(vertical = 14.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.Center
-                                        ) {
-                                            Icon(
-                                                imageVector = item.icon,
-                                                contentDescription = item.title,
-                                                tint = item.iconColor,
-                                                modifier = Modifier.size(22.dp)
-                                            )
-                                            Spacer(modifier = Modifier.height(6.dp))
-                                            Text(
-                                                text = item.title,
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = EcoTextDark
-                                            )
-                                        }
-                                    }
-                                }
+                            rowItems.forEach { item ->
+                                QuickActionCard(
+                                    item = item,
+                                    onClick = { onSelectGridFeature(item.title) },
+                                    modifier = Modifier.weight(1f)
+                                )
                             }
+                            repeat(3 - rowItems.size) { Spacer(modifier = Modifier.weight(1f)) }
                         }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            for (i in 3..5) {
-                                if (i < actionGridList.size) {
-                                    val item = actionGridList[i]
-                                    Card(
-                                        onClick = { onSelectGridFeature(item.title) },
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(vertical = 14.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.Center
-                                        ) {
-                                            Icon(
-                                                imageVector = item.icon,
-                                                contentDescription = item.title,
-                                                tint = item.iconColor,
-                                                modifier = Modifier.size(22.dp)
-                                            )
-                                            Spacer(modifier = Modifier.height(6.dp))
-                                            Text(
-                                                text = item.title,
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = EcoTextDark
-                                            )
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -964,6 +1012,42 @@ fun HomeScreenContent(
 // 2. NEW WASTE REPORT FORM SCREEN WITH 100% ACCURATE REAL-TIME TIMESTAMP & PERMANENT STORAGE
 // -----------------------------------------------------------------------------
 @Composable
+private fun QuickActionCard(
+    item: ActionGridItem,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        onClick = onClick,
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
+        modifier = modifier
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = item.icon,
+                contentDescription = item.title,
+                tint = item.iconColor,
+                modifier = Modifier.size(22.dp)
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = item.title,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = EcoTextDark
+            )
+        }
+    }
+}
+
+@Composable
 fun NewWasteReportScreen(
     onBack: () -> Unit,
     onSubmit: (WasteReportItem) -> Unit
@@ -971,18 +1055,68 @@ fun NewWasteReportScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var capturedPhotoBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var selectedCategory by remember { mutableStateOf("Illegal Dump Site") }
-    var gpsCoordinates by remember { mutableStateOf("8.4822° N, 124.6175° E") }
-    var barangayInput by remember { mutableStateOf("Carmen") }
-    var purokInput by remember { mutableStateOf("Zone 3") }
-    var landmarkInput by remember { mutableStateOf("Near Barangay Health Center") }
-    var remarksInput by remember { mutableStateOf("Trash has been uncollected for 3 days.") }
+    var selectedCategory by rememberSaveable { mutableStateOf("Illegal Dump Site") }
+    var gpsCoordinates by rememberSaveable { mutableStateOf("") }
+    var barangayInput by rememberSaveable { mutableStateOf("") }
+    var purokInput by rememberSaveable { mutableStateOf("") }
+    var locationStatus by rememberSaveable { mutableStateOf("Getting your current location...") }
+    var isFetchingLocation by remember { mutableStateOf(false) }
+    var locationFetchJob by remember { mutableStateOf<Job?>(null) }
+    var landmarkInput by rememberSaveable { mutableStateOf("") }
+    var remarksInput by rememberSaveable { mutableStateOf("") }
+
+    fun fetchCurrentLocation() {
+        locationFetchJob?.cancel()
+        gpsCoordinates = ""
+        barangayInput = ""
+        purokInput = ""
+        isFetchingLocation = true
+        locationStatus = "Getting your current location..."
+        locationFetchJob = coroutineScope.launch {
+            try {
+                val currentLocation = fetchRealDeviceLocation(context)
+                gpsCoordinates = currentLocation.gpsCoordinates
+                barangayInput = currentLocation.barangay
+                purokInput = currentLocation.purokZone
+                locationStatus = if (currentLocation.barangay == "GPS location") {
+                    "GPS found; street address is unavailable"
+                } else {
+                    "Current GPS location found"
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                locationStatus = e.message ?: "Could not get your current location. Try again."
+            } finally {
+                if (locationFetchJob == currentCoroutineContext()[Job]) {
+                    isFetchingLocation = false
+                }
+            }
+        }
+    }
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val hasPermission =
+            permissions[android.Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (hasPermission) {
+            fetchCurrentLocation()
+        } else {
+            locationStatus = "Allow location access to place this report at your current location."
+        }
+    }
 
     LaunchedEffect(Unit) {
-        fetchRealDeviceLocation(context) { gps, bgy, purok ->
-            gpsCoordinates = gps
-            barangayInput = bgy
-            purokInput = purok
+        if (hasDeviceLocationPermission(context)) {
+            fetchCurrentLocation()
+        } else {
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    android.Manifest.permission.ACCESS_FINE_LOCATION,
+                    android.Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
         }
     }
 
@@ -991,6 +1125,9 @@ fun NewWasteReportScreen(
     ) { bitmap ->
         if (bitmap != null) {
             capturedPhotoBitmap = bitmap
+            if (hasDeviceLocationPermission(context)) {
+                fetchCurrentLocation()
+            }
         }
     }
 
@@ -1007,6 +1144,9 @@ fun NewWasteReportScreen(
     }
 
     fun safeLaunchCamera() {
+        if (hasDeviceLocationPermission(context)) {
+            fetchCurrentLocation()
+        }
         try {
             cameraLauncher.launch(null)
         } catch (_: SecurityException) {
@@ -1148,11 +1288,57 @@ fun NewWasteReportScreen(
                             )
                         }
 
-                        MapPreviewBox(
-                            heightDp = 110,
-                            locationName = "$barangayInput, Cagayan de Oro",
-                            gpsCoordinates = gpsCoordinates
-                        )
+                        if (gpsCoordinates.isNotBlank()) {
+                                MapPreviewBox(
+                                heightDp = 110,
+                                locationName = listOf(purokInput, barangayInput)
+                                    .filter { it.isNotBlank() }
+                                    .joinToString(", ")
+                                    .ifBlank { "Current GPS location" },
+                                gpsCoordinates = gpsCoordinates
+                            )
+                            Text(
+                                text = "GPS coordinates: $gpsCoordinates",
+                                fontSize = 11.sp,
+                                color = EcoTextMuted
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(110.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Color(0xFFF1F5F9)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "Map will show after GPS is found",
+                                    fontSize = 12.sp,
+                                    color = EcoTextMuted
+                                )
+                            }
+                            Text(
+                                text = locationStatus,
+                                fontSize = 12.sp,
+                                color = EcoTextMuted
+                            )
+                            TextButton(
+                                onClick = {
+                                    if (hasDeviceLocationPermission(context)) {
+                                        fetchCurrentLocation()
+                                    } else {
+                                        locationPermissionLauncher.launch(
+                                            arrayOf(
+                                                android.Manifest.permission.ACCESS_FINE_LOCATION,
+                                                android.Manifest.permission.ACCESS_COARSE_LOCATION
+                                            )
+                                        )
+                                    }
+                                }
+                            ) {
+                                Text("Retry current location")
+                            }
+                        }
 
                         Text("Barangay (Auto-Detected from Map)", fontSize = 11.sp, color = EcoPrimaryGreen, fontWeight = FontWeight.Bold)
                         OutlinedTextField(
@@ -1277,15 +1463,28 @@ fun NewWasteReportScreen(
 
             item {
                 Button(
+                    enabled = gpsCoordinates.isNotBlank() && !isFetchingLocation,
                     onClick = {
+                        if (gpsCoordinates.isBlank()) {
+                            Toast.makeText(
+                                context,
+                                "Wait for your current GPS location before submitting.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            return@Button
+                        }
                         val newId = "#CDO-2026-" + (1000..9999).random()
                         // 100% Accurate Real-Time Posted Timestamp
                         val accuratePostedTime = SimpleDateFormat("MMM d, yyyy • h:mm a", Locale.US).format(Date())
                         val photoBase64Str = capturedPhotoBitmap?.let { CityCareApiService.bitmapToBase64(it) }
 
+                        val reportLocationLabel = listOf(barangayInput, purokInput)
+                            .filterNot { it == "GPS location" || it == "Address unavailable" }
+                            .filter { it.isNotBlank() }
+                            .joinToString(", ")
                         val newReport = WasteReportItem(
                             id = newId,
-                            title = "Brgy. $barangayInput, $purokInput",
+                            title = reportLocationLabel.ifBlank { "Location: $gpsCoordinates" },
                             barangay = barangayInput,
                             date = accuratePostedTime,
                             status = "PENDING",
@@ -1342,53 +1541,83 @@ fun NewWasteReportScreen(
     }
 }
 
-// Helper to fetch device GPS location
-fun fetchRealDeviceLocation(
-    context: android.content.Context,
-    onLocationFetched: (gpsCoordinates: String, barangay: String, purokZone: String) -> Unit
-) {
-    try {
-        if (androidx.core.content.ContextCompat.checkSelfPermission(
-                context,
-                android.Manifest.permission.ACCESS_FINE_LOCATION
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
-            androidx.core.content.ContextCompat.checkSelfPermission(
-                context,
-                android.Manifest.permission.ACCESS_COARSE_LOCATION
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            val fusedLocationClient = com.google.android.gms.location.LocationServices.getFusedLocationProviderClient(context)
-            fusedLocationClient.lastLocation.addOnSuccessListener { location: android.location.Location? ->
-                if (location != null) {
-                    val lat = location.latitude
-                    val lng = location.longitude
-                    val latDir = if (lat >= 0) "N" else "S"
-                    val lngDir = if (lng >= 0) "E" else "W"
-                    val formattedGps = String.format(Locale.US, "%.4f° %s, %.4f° %s", kotlin.math.abs(lat), latDir, kotlin.math.abs(lng), lngDir)
+private data class ReportDeviceLocation(
+    val gpsCoordinates: String,
+    val barangay: String,
+    val purokZone: String
+)
 
-                    var detectedBarangay = "Carmen"
-                    var detectedPurok = "Zone 3"
+private fun hasDeviceLocationPermission(context: android.content.Context): Boolean =
+    androidx.core.content.ContextCompat.checkSelfPermission(
+        context,
+        android.Manifest.permission.ACCESS_FINE_LOCATION
+    ) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+        androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
-                    try {
-                        val geocoder = Geocoder(context, Locale.getDefault())
-                        @Suppress("DEPRECATION")
-                        val addresses = geocoder.getFromLocation(lat, lng, 1)
-                        if (!addresses.isNullOrEmpty()) {
-                            val address = addresses[0]
-                            detectedBarangay = address.subLocality ?: address.locality ?: "Carmen"
-                            detectedPurok = address.thoroughfare ?: address.featureName ?: "Zone 3"
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-
-                    onLocationFetched(formattedGps, detectedBarangay, detectedPurok)
-                }
-            }
-        }
-    } catch (e: Exception) {
-        e.printStackTrace()
+private suspend fun fetchRealDeviceLocation(
+    context: android.content.Context
+): ReportDeviceLocation = withContext(Dispatchers.IO) {
+    if (!hasDeviceLocationPermission(context)) {
+        throw SecurityException("Location permission is required to place this report.")
     }
+
+    val locationClient =
+        com.google.android.gms.location.LocationServices.getFusedLocationProviderClient(context)
+    val location = try {
+        com.google.android.gms.tasks.Tasks.await(
+            locationClient.getCurrentLocation(
+                com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY,
+                com.google.android.gms.tasks.CancellationTokenSource().token
+            ),
+            30,
+            TimeUnit.SECONDS
+        )
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        throw IOException("Could not get your current GPS location. Check that location is enabled and retry.", e)
+    } ?: throw IOException("No GPS fix was returned. Move to an open area and retry.")
+
+    val latitude = location.latitude
+    val longitude = location.longitude
+    val latitudeDirection = if (latitude >= 0) "N" else "S"
+    val longitudeDirection = if (longitude >= 0) "E" else "W"
+    val formattedGps = String.format(
+        Locale.US,
+        "%.6f° %s, %.6f° %s",
+        kotlin.math.abs(latitude),
+        latitudeDirection,
+        kotlin.math.abs(longitude),
+        longitudeDirection
+    )
+
+    val address = try {
+        if (Geocoder.isPresent()) {
+            @Suppress("DEPRECATION")
+            Geocoder(context, Locale.getDefault())
+                .getFromLocation(latitude, longitude, 1)
+                ?.firstOrNull()
+        } else {
+            null
+        }
+    } catch (e: IOException) {
+        android.util.Log.w("CityCareLocation", "Reverse geocoding is unavailable", e)
+        null
+    }
+
+    ReportDeviceLocation(
+        gpsCoordinates = formattedGps,
+        barangay = address?.subLocality
+            ?: address?.subAdminArea
+            ?: address?.locality
+            ?: "GPS location",
+        purokZone = address?.thoroughfare
+            ?: address?.featureName
+            ?: "Address unavailable"
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -1397,16 +1626,20 @@ fun fetchRealDeviceLocation(
 @Composable
 fun MyReportsScreenContent(
     reports: List<WasteReportItem>,
-    onOpenNotifications: () -> Unit,
+    initialStatusFilter: String = "ALL",
     onOpenProfile: () -> Unit,
     onSelectReport: (WasteReportItem) -> Unit
 ) {
     var searchQuery by remember { mutableStateOf("") }
-    var selectedFilter by remember { mutableStateOf("ALL") }
+    var selectedFilter by remember(initialStatusFilter) { mutableStateOf(initialStatusFilter) }
 
     val filteredReports = reports.filter { report ->
-        val matchesStatus = selectedFilter == "ALL" ||
-                report.status.uppercase().replace(' ', '_') == selectedFilter
+        val normalizedStatus = report.status.uppercase().replace('-', '_').replace(' ', '_')
+        val matchesStatus = when (selectedFilter) {
+            "ALL" -> true
+            "DONE" -> normalizedStatus in setOf("RESOLVED", "DONE", "COMPLETED")
+            else -> normalizedStatus == selectedFilter
+        }
         val matchesSearch = report.title.contains(searchQuery, ignoreCase = true) ||
                 report.id.contains(searchQuery, ignoreCase = true)
         val matchesUser = report.userEmail.isEmpty() || report.userEmail.equals(CityCareApiService.currentUserEmail, ignoreCase = true)
@@ -1444,22 +1677,6 @@ fun MyReportsScreenContent(
                         onClick = onOpenProfile
                     )
 
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(Color.White)
-                            .border(1.dp, EcoCardBorder, CircleShape)
-                            .clickable { onOpenNotifications() },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Notifications,
-                            contentDescription = "Notifications",
-                            tint = EcoTextDark,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
                 }
             }
         }
@@ -1508,14 +1725,14 @@ fun MyReportsScreenContent(
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                listOf("ALL", "PENDING", "ASSIGNED", "IN_PROGRESS", "RESOLVED", "REJECTED").forEach { filter ->
+                listOf("ALL", "PENDING", "ASSIGNED", "IN_PROGRESS", "DONE", "REJECTED").forEach { filter ->
                     val isSelected = selectedFilter == filter
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.clickable { selectedFilter = filter }
                     ) {
                         Text(
-                            text = filter.replace('_', ' '),
+                            text = if (filter == "ALL") filter else filter.replace('_', ' '),
                             fontSize = 11.sp,
                             fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold,
                             color = if (isSelected) EcoPrimaryGreen else EcoTextMuted
@@ -1616,8 +1833,8 @@ fun MyReportsScreenContent(
 // -----------------------------------------------------------------------------
 @Composable
 fun SupportScreenContent(
+    onBack: () -> Unit = {},
     onOpenNotifications: () -> Unit = {},
-    onOpenNewTicket: () -> Unit = {},
     onSelectReport: (WasteReportItem) -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -1630,7 +1847,21 @@ fun SupportScreenContent(
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         item {
-            Spacer(modifier = Modifier.height(16.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back",
+                        tint = EcoPrimaryGreen
+                    )
+                }
+                Text("Support", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = EcoPrimaryGreen)
+            }
 
             Row(
                 modifier = Modifier
@@ -1661,7 +1892,7 @@ fun SupportScreenContent(
                 }
 
                 Text(
-                    text = "Facing issues? Create a ticket for quick resolution!",
+                    text = "Need help? Contact CLENRO or review your complaint history.",
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Bold,
                     color = EcoTextDark,
@@ -1672,41 +1903,121 @@ fun SupportScreenContent(
         }
 
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Button(
-                    onClick = onOpenNewTicket,
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D4B3E)),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(46.dp)
-                ) {
-                    Text(
-                        text = "Create Ticket",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                }
+            var showContactChoiceDialog by remember { mutableStateOf(false) }
 
-                OutlinedButton(
-                    onClick = { Toast.makeText(context, "Calling CLENRO Hotline (088) 857-3200...", Toast.LENGTH_SHORT).show() },
+            OutlinedButton(
+                    onClick = { showContactChoiceDialog = true },
                     shape = RoundedCornerShape(10.dp),
                     border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2D4B3E)),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF2D4B3E)),
                     modifier = Modifier
-                        .weight(1f)
+                        .fillMaxWidth()
                         .height(46.dp)
                 ) {
                     Text(
-                        text = "Call Support",
+                        text = "Contact CLENRO",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
+
+            if (showContactChoiceDialog) {
+                AlertDialog(
+                    onDismissRequest = { showContactChoiceDialog = false },
+                    title = {
+                        Text(
+                            text = "CLENRO Customer Support",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 17.sp,
+                            color = EcoTextDark
+                        )
+                    },
+                    text = {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text(
+                                text = "Choose how you would like to reach the City Environment & Natural Resources Office:",
+                                fontSize = 12.sp,
+                                color = EcoTextMuted
+                            )
+
+                            // Option 1: Call Landline
+                            Card(
+                                onClick = {
+                                    showContactChoiceDialog = false
+                                    try {
+                                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:0888572280"))
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Hotline: (088) 857-2280", Toast.LENGTH_LONG).show()
+                                    }
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Phone,
+                                        contentDescription = null,
+                                        tint = EcoPrimaryGreen,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column {
+                                        Text("Call CLENRO Landline", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = EcoTextDark)
+                                        Text("(088) 857-2280 / (088) 857-4140", fontSize = 11.sp, color = EcoTextMuted)
+                                    }
+                                }
+                            }
+
+                            // Option 2: Email Gmail
+                            Card(
+                                onClick = {
+                                    showContactChoiceDialog = false
+                                    try {
+                                        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:clenro@cagayandeoro.gov.ph")).apply {
+                                            putExtra(Intent.EXTRA_EMAIL, arrayOf("clenro@cagayandeoro.gov.ph", "clenro.cdo@gmail.com"))
+                                            putExtra(Intent.EXTRA_SUBJECT, "CityCare Resident Support Inquiry")
+                                        }
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Email: clenro@cagayandeoro.gov.ph", Toast.LENGTH_LONG).show()
+                                    }
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Email,
+                                        contentDescription = null,
+                                        tint = EcoPrimaryGreen,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column {
+                                        Text("Email CLENRO Support", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = EcoTextDark)
+                                        Text("clenro@cagayandeoro.gov.ph", fontSize = 11.sp, color = EcoTextMuted)
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showContactChoiceDialog = false }) {
+                            Text("CLOSE", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                )
             }
         }
 
@@ -1811,19 +2122,16 @@ fun SupportScreenContent(
 // -----------------------------------------------------------------------------
 @Composable
 fun MoreScreenContent(
-    onOpenNotifications: () -> Unit = {},
-    onOpenTips: () -> Unit = {}
+    onOpenProfile: () -> Unit = {},
+    onOpenSupport: () -> Unit = {},
+    onOpenItem: (String) -> Unit = {}
 ) {
-    val context = LocalContext.current
-
     val moreItems = listOf(
+        "Profile",
+        "Support",
         "Privacy Settings",
-        "Notification Settings",
         "Payment Methods",
-        "Language Settings",
-        "Data Settings",
-        "Legal Information",
-        "FAQs"
+        "Legal Information"
     )
 
     LazyColumn(
@@ -1839,10 +2147,12 @@ fun MoreScreenContent(
         items(moreItems) { title ->
             Card(
                 onClick = {
-                    if (title == "FAQs") {
-                        onOpenTips()
+                    if (title == "Profile") {
+                        onOpenProfile()
+                    } else if (title == "Support") {
+                        onOpenSupport()
                     } else {
-                        Toast.makeText(context, "Opening $title...", Toast.LENGTH_SHORT).show()
+                        onOpenItem(title)
                     }
                 },
                 shape = RoundedCornerShape(12.dp),
@@ -1906,6 +2216,143 @@ fun MoreScreenContent(
         }
 
         item { Spacer(modifier = Modifier.height(20.dp)) }
+    }
+}
+
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+fun MoreSettingsDetailScreen(
+    title: String,
+    onBack: () -> Unit
+) {
+    val details = remember(title) {
+        when (title) {
+            "Privacy Settings" -> listOf(
+                "Profile visibility is set to Private",
+                "Location access is used only for service matching",
+                "Personal data is used to improve city waste alerts"
+            )
+            "Payment Methods" -> listOf(
+                "No active payment method linked yet",
+                "Wallet balance: Php 0.00",
+                "Payment setup can be completed under billing settings"
+            )
+            "Legal Information" -> listOf(
+                "Terms of service updated for 2026",
+                "Privacy policy is available in the app help center",
+                "Data handling follows local digital service standards"
+            )
+            else -> emptyList()
+        }
+    }
+
+    val summary = remember(title) {
+        when (title) {
+            "Privacy Settings" -> "Manage your profile visibility, data sharing, and account protection."
+            "Payment Methods" -> "Review all your saved billing and payment preferences."
+            "Legal Information" -> "Read the policies and legal guidance for using CityCare."
+            else -> "View your CityCare account settings."
+        }
+    }
+
+    Surface(
+        color = Color(0xFFF8FAFC),
+        modifier = Modifier.fillMaxSize()
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            TopAppBar(
+                title = { Text(title) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back"
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = EcoHeaderDark,
+                    titleContentColor = Color.White,
+                    navigationIconContentColor = Color.White
+                )
+            )
+
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 18.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    Card(
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp)
+                        ) {
+                            Text(
+                                text = title,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = EcoTextDark
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = summary,
+                                fontSize = 13.sp,
+                                color = EcoTextMuted
+                            )
+                        }
+                    }
+                }
+
+                items(details) { detail ->
+                    Card(
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = EcoPrimaryGreen,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text(
+                                text = detail,
+                                fontSize = 13.sp,
+                                color = EcoTextDark,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+
+                item {
+                    Button(
+                        onClick = onBack,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = EcoPrimaryGreen)
+                    ) {
+                        Text("Back to More")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2325,8 +2772,223 @@ fun TicketDetailsScreen(
 }
 
 // -----------------------------------------------------------------------------
-// 7. NOTIFICATIONS SCREEN
+// COLLECTION SCHEDULE SCREEN
 // -----------------------------------------------------------------------------
+@Composable
+fun CollectionScheduleScreen(
+    onBack: () -> Unit
+) {
+    var schedules by remember { mutableStateOf<List<CityCareCollectionSchedule>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+    var refreshKey by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(refreshKey) {
+        isLoading = true
+        loadError = null
+        try {
+            schedules = CityCareApiService.fetchSchedulesFromCloud()
+        } catch (error: Exception) {
+            loadError = "Could not load collection schedules. Check your connection and try again."
+        } finally {
+            isLoading = false
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFFF8FAFC))
+    ) {
+        Surface(
+            color = Color.White,
+            shadowElevation = 2.dp,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back",
+                        tint = EcoTextDark
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "Collection Schedule",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = EcoPrimaryGreen
+                )
+            }
+        }
+
+        when {
+            isLoading -> Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = EcoPrimaryGreen)
+            }
+
+            loadError != null -> Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = loadError.orEmpty(),
+                    color = EcoTextMuted,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = { refreshKey++ },
+                    colors = ButtonDefaults.buttonColors(containerColor = EcoPrimaryGreen)
+                ) {
+                    Text("Retry")
+                }
+            }
+
+            schedules.isEmpty() -> Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "No collection schedules have been published yet.",
+                    color = EcoTextMuted,
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            else -> LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 18.dp),
+                contentPadding = PaddingValues(vertical = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    Text(
+                        text = "Collection routes by barangay, including any clearly labeled sample schedules.",
+                        fontSize = 13.sp,
+                        color = EcoTextMuted
+                    )
+                }
+                items(schedules, key = { it.barangay }) { schedule ->
+                    Card(
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = "Barangay ${schedule.barangay}",
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = EcoTextDark
+                            )
+                            if (schedule.areaSchedules.isEmpty()) {
+                                Text(
+                                    text = "No purok-, zone-, or street-specific route has been published.",
+                                    fontSize = 12.sp,
+                                    color = EcoTextMuted
+                                )
+                            } else {
+                                schedule.areaSchedules.forEach { areaSchedule ->
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(Color(0xFFF8FAFC), RoundedCornerShape(10.dp))
+                                            .padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Text(
+                                            text = areaSchedule.areaName,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = EcoPrimaryGreen
+                                        )
+                                        if (areaSchedule.isSample) {
+                                            Text(
+                                                text = "SAMPLE ONLY — NOT AN OFFICIAL OR CONFIRMED CLENRO ROUTE",
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color(0xFF9A3412)
+                                            )
+                                        }
+                                        if (areaSchedule.appliesToAllAreas) {
+                                            Text(
+                                                text = "Example fallback only; exact area routes take priority.",
+                                                fontSize = 11.sp,
+                                                color = EcoTextMuted
+                                            )
+                                        }
+                                        CollectionScheduleDetail(
+                                            label = "Biodegradable",
+                                            value = areaSchedule.biodegradableDays
+                                        )
+                                        CollectionScheduleDetail(
+                                            label = "Non-biodegradable",
+                                            value = areaSchedule.nonBiodegradableDays
+                                        )
+                                        CollectionScheduleDetail(
+                                            label = "Collection time",
+                                            value = areaSchedule.timeSlot
+                                        )
+                                        CollectionScheduleDetail(
+                                            label = "Assigned truck",
+                                            value = areaSchedule.assignedTruck
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CollectionScheduleDetail(
+    label: String,
+    value: String
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = "$label:",
+            modifier = Modifier.width(132.dp),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = EcoTextMuted
+        )
+        Text(
+            text = value,
+            modifier = Modifier.weight(1f),
+            fontSize = 12.sp,
+            color = EcoTextDark
+        )
+    }
+}
+
 @Composable
 fun NotificationsScreen(
     onBack: () -> Unit
@@ -2706,21 +3368,65 @@ fun TipThumbnailBox(
 @Composable
 fun ProfileScreenContent(
     onBack: () -> Unit = {},
-    onOpenNotifications: () -> Unit,
     onLogout: () -> Unit
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    var showEditAccountDialog by remember { mutableStateOf(false) }
+    var showEditLocationDialog by remember { mutableStateOf(false) }
+    var isSavingProfile by remember { mutableStateOf(false) }
+    var profileRevision by remember { mutableIntStateOf(0) }
+    val profilePreferences = remember {
+        context.getSharedPreferences("citycare_profile_preferences", android.content.Context.MODE_PRIVATE)
+    }
+    var showNotificationPreferences by remember { mutableStateOf(false) }
+    var showChangePasswordDialog by remember { mutableStateOf(false) }
+    var supportDialogTitle by remember { mutableStateOf<String?>(null) }
+    var isChangingPassword by remember { mutableStateOf(false) }
+    var currentPasswordInput by remember { mutableStateOf("") }
+    var newPasswordInput by remember { mutableStateOf("") }
+    var confirmNewPasswordInput by remember { mutableStateOf("") }
+    var collectionNotificationsEnabled by remember {
+        mutableStateOf(profilePreferences.getBoolean("collection_notifications", true))
+    }
+    var reportNotificationsEnabled by remember {
+        mutableStateOf(profilePreferences.getBoolean("report_notifications", true))
+    }
+    var editName by remember { mutableStateOf(CityCareApiService.currentUserName) }
+    var editEmail by remember { mutableStateOf(CityCareApiService.currentUserEmail) }
+    var editPhone by remember { mutableStateOf(CityCareApiService.currentUserPhone) }
+    var editBarangay by remember { mutableStateOf(CityCareApiService.currentUserBarangay) }
+    var editPurok by remember { mutableStateOf(CityCareApiService.currentUserPurok) }
+    profileRevision
 
-    var profileBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var profileBitmap by remember { mutableStateOf(CityCareApiService.loadCurrentProfilePhoto(context)) }
     var coverBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var showProfilePicker by remember { mutableStateOf(false) }
     var showCoverPicker by remember { mutableStateOf(false) }
+
+    fun saveProfilePhoto(bitmap: Bitmap?) {
+        coroutineScope.launch {
+            isSavingProfile = true
+            val result = CityCareApiService.updateProfilePhoto(context, bitmap)
+            isSavingProfile = false
+            Toast.makeText(context, result.second, Toast.LENGTH_LONG).show()
+            if (result.first) {
+                profileBitmap = bitmap
+                profileRevision++
+            }
+        }
+    }
 
     val profileGalleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null) {
-            profileBitmap = loadBitmapFromUri(context, uri)
+            val bitmap = loadBitmapFromUri(context, uri)
+            if (bitmap == null) {
+                Toast.makeText(context, "Could not open that image. Please try another photo.", Toast.LENGTH_LONG).show()
+            } else {
+                saveProfilePhoto(bitmap)
+            }
         }
     }
 
@@ -2728,7 +3434,7 @@ fun ProfileScreenContent(
         contract = ActivityResultContracts.TakePicturePreview()
     ) { bitmap ->
         if (bitmap != null) {
-            profileBitmap = bitmap
+            saveProfilePhoto(bitmap)
         }
     }
 
@@ -2780,22 +3486,6 @@ fun ProfileScreenContent(
                     )
                 }
 
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(CircleShape)
-                        .background(Color.White)
-                        .border(1.dp, EcoCardBorder, CircleShape)
-                        .clickable { onOpenNotifications() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Notifications,
-                        contentDescription = "Notifications",
-                        tint = EcoTextDark,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
             }
         }
 
@@ -3017,9 +3707,26 @@ fun ProfileScreenContent(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column {
-                        ProfileMenuRow(icon = Icons.Outlined.Edit, title = "Edit Account Details")
+                        ProfileMenuRow(
+                            icon = Icons.Outlined.Edit,
+                            title = "Edit Account Details",
+                            onClick = {
+                                editName = CityCareApiService.currentUserName
+                                editEmail = CityCareApiService.currentUserEmail
+                                editPhone = CityCareApiService.currentUserPhone
+                                showEditAccountDialog = true
+                            }
+                        )
                         HorizontalDivider(color = Color(0xFFF1F5F9))
-                        ProfileMenuRow(icon = Icons.Outlined.Map, title = "Update Default Barangay / Purok")
+                        ProfileMenuRow(
+                            icon = Icons.Outlined.Map,
+                            title = "Update Default Barangay / Purok",
+                            onClick = {
+                                editBarangay = CityCareApiService.currentUserBarangay
+                                editPurok = CityCareApiService.currentUserPurok
+                                showEditLocationDialog = true
+                            }
+                        )
                     }
                 }
             }
@@ -3036,9 +3743,22 @@ fun ProfileScreenContent(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column {
-                        ProfileMenuRow(icon = Icons.Outlined.Notifications, title = "Push Notification Preferences")
+                        ProfileMenuRow(
+                            icon = Icons.Outlined.Notifications,
+                            title = "Push Notification Preferences",
+                            onClick = { showNotificationPreferences = true }
+                        )
                         HorizontalDivider(color = Color(0xFFF1F5F9))
-                        ProfileMenuRow(icon = Icons.Outlined.Lock, title = "Change Password")
+                        ProfileMenuRow(
+                            icon = Icons.Outlined.Lock,
+                            title = "Change Password",
+                            onClick = {
+                                currentPasswordInput = ""
+                                newPasswordInput = ""
+                                confirmNewPasswordInput = ""
+                                showChangePasswordDialog = true
+                            }
+                        )
                     }
                 }
             }
@@ -3055,9 +3775,17 @@ fun ProfileScreenContent(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column {
-                        ProfileMenuRow(icon = Icons.Outlined.Description, title = "Terms of Service & Privacy Policy")
+                        ProfileMenuRow(
+                            icon = Icons.Outlined.Description,
+                            title = "Terms of Service & Privacy Policy",
+                            onClick = { supportDialogTitle = "Terms of Service & Privacy Policy" }
+                        )
                         HorizontalDivider(color = Color(0xFFF1F5F9))
-                        ProfileMenuRow(icon = Icons.Outlined.HelpOutline, title = "Help & FAQ")
+                        ProfileMenuRow(
+                            icon = Icons.Outlined.HelpOutline,
+                            title = "Help & FAQ",
+                            onClick = { supportDialogTitle = "Help & FAQ" }
+                        )
                     }
                 }
             }
@@ -3079,30 +3807,267 @@ fun ProfileScreenContent(
         }
     }
 
+    if (showNotificationPreferences) {
+        AlertDialog(
+            onDismissRequest = { showNotificationPreferences = false },
+            title = { Text("Push Notification Preferences", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "Choose which CityCare updates you want enabled on this device.",
+                        fontSize = 13.sp,
+                        color = EcoTextMuted
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Collection reminders", modifier = Modifier.weight(1f), fontSize = 14.sp)
+                        Switch(
+                            checked = collectionNotificationsEnabled,
+                            onCheckedChange = {
+                                collectionNotificationsEnabled = it
+                                profilePreferences.edit().putBoolean("collection_notifications", it).apply()
+                            }
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Report status updates", modifier = Modifier.weight(1f), fontSize = 14.sp)
+                        Switch(
+                            checked = reportNotificationsEnabled,
+                            onCheckedChange = {
+                                reportNotificationsEnabled = it
+                                profilePreferences.edit().putBoolean("report_notifications", it).apply()
+                            }
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showNotificationPreferences = false }) {
+                    Text("Done")
+                }
+            }
+        )
+    }
+
+    if (showChangePasswordDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!isChangingPassword) showChangePasswordDialog = false },
+            title = { Text("Change Password", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = currentPasswordInput,
+                        onValueChange = { currentPasswordInput = it },
+                        label = { Text("Current password") },
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = newPasswordInput,
+                        onValueChange = { newPasswordInput = it },
+                        label = { Text("New password (at least 6 characters)") },
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = confirmNewPasswordInput,
+                        onValueChange = { confirmNewPasswordInput = it },
+                        label = { Text("Confirm new password") },
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isChangingPassword,
+                    onClick = {
+                        when {
+                            currentPasswordInput.isBlank() -> Toast.makeText(context, "Enter your current password.", Toast.LENGTH_SHORT).show()
+                            newPasswordInput.length < 6 -> Toast.makeText(context, "New password must be at least 6 characters.", Toast.LENGTH_SHORT).show()
+                            newPasswordInput != confirmNewPasswordInput -> Toast.makeText(context, "New passwords do not match.", Toast.LENGTH_SHORT).show()
+                            else -> coroutineScope.launch {
+                                isChangingPassword = true
+                                val result = CityCareApiService.changeUserPassword(currentPasswordInput, newPasswordInput)
+                                isChangingPassword = false
+                                Toast.makeText(context, result.second, Toast.LENGTH_LONG).show()
+                                if (result.first) showChangePasswordDialog = false
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = EcoPrimaryGreen)
+                ) {
+                    Text(if (isChangingPassword) "Saving..." else "Change")
+                }
+            },
+            dismissButton = {
+                TextButton(enabled = !isChangingPassword, onClick = { showChangePasswordDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    supportDialogTitle?.let { title ->
+        AlertDialog(
+            onDismissRequest = { supportDialogTitle = null },
+            title = { Text(title, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    if (title == "Help & FAQ") {
+                        "To report uncollected waste, use the camera button and submit the location and details. Open My Reports to follow the status. For account support, contact your barangay help desk."
+                    } else {
+                        "CityCare uses your account details and chosen location to manage waste reports and service updates. Keep your account information accurate, protect your password, and only submit information needed to resolve a service issue."
+                    },
+                    fontSize = 14.sp,
+                    color = EcoTextDark
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { supportDialogTitle = null }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
+    if (showEditAccountDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!isSavingProfile) showEditAccountDialog = false },
+            title = { Text("Edit Account Details", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(value = editName, onValueChange = { editName = it }, label = { Text("Full name") }, singleLine = true)
+                    OutlinedTextField(value = editEmail, onValueChange = { editEmail = it }, label = { Text("Email") }, singleLine = true)
+                    OutlinedTextField(value = editPhone, onValueChange = { editPhone = it }, label = { Text("Phone number") }, singleLine = true)
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isSavingProfile,
+                    onClick = {
+                        coroutineScope.launch {
+                            isSavingProfile = true
+                            val result = CityCareApiService.updateUserProfile(
+                                context = context,
+                                name = editName,
+                                email = editEmail,
+                                phone = editPhone,
+                                barangay = CityCareApiService.currentUserBarangay,
+                                purok = CityCareApiService.currentUserPurok
+                            )
+                            isSavingProfile = false
+                            Toast.makeText(context, result.second, Toast.LENGTH_LONG).show()
+                            if (result.first) {
+                                profileRevision++
+                                showEditAccountDialog = false
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = EcoPrimaryGreen)
+                ) {
+                    Text(if (isSavingProfile) "Saving..." else "Save")
+                }
+            },
+            dismissButton = {
+                TextButton(enabled = !isSavingProfile, onClick = { showEditAccountDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showEditLocationDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!isSavingProfile) showEditLocationDialog = false },
+            title = { Text("Update Default Location", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(value = editBarangay, onValueChange = { editBarangay = it }, label = { Text("Barangay") }, singleLine = true)
+                    OutlinedTextField(value = editPurok, onValueChange = { editPurok = it }, label = { Text("Purok / Zone") }, singleLine = true)
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isSavingProfile,
+                    onClick = {
+                        coroutineScope.launch {
+                            isSavingProfile = true
+                            val result = CityCareApiService.updateUserProfile(
+                                context = context,
+                                name = CityCareApiService.currentUserName,
+                                email = CityCareApiService.currentUserEmail,
+                                phone = CityCareApiService.currentUserPhone,
+                                barangay = editBarangay,
+                                purok = editPurok
+                            )
+                            isSavingProfile = false
+                            Toast.makeText(context, result.second, Toast.LENGTH_LONG).show()
+                            if (result.first) {
+                                profileRevision++
+                                showEditLocationDialog = false
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = EcoPrimaryGreen)
+                ) {
+                    Text(if (isSavingProfile) "Saving..." else "Save")
+                }
+            },
+            dismissButton = {
+                TextButton(enabled = !isSavingProfile, onClick = { showEditLocationDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     if (showProfilePicker) {
         AlertDialog(
             onDismissRequest = { showProfilePicker = false },
-            title = { Text("Update Profile Picture", fontWeight = FontWeight.Bold) },
-            text = { Text("Choose how you would like to update your profile photo.") },
+            title = { Text("Profile Picture", fontWeight = FontWeight.Bold) },
+            text = { Text("Choose a new photo or remove your current profile picture.") },
             confirmButton = {
                 Button(
+                    enabled = !isSavingProfile,
                     onClick = {
                         showProfilePicker = false
                         profileGalleryLauncher.launch("image/*")
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = EcoPrimaryGreen)
                 ) {
-                    Text("Choose from Gallery", fontWeight = FontWeight.Bold)
+                    Text(if (isSavingProfile) "Saving..." else "Choose from Gallery", fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
-                OutlinedButton(
-                    onClick = {
-                        showProfilePicker = false
-                        profileCameraLauncher.launch(null)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    OutlinedButton(
+                        enabled = !isSavingProfile,
+                        onClick = {
+                            showProfilePicker = false
+                            profileCameraLauncher.launch(null)
+                        }
+                    ) {
+                        Text("Camera")
                     }
-                ) {
-                    Text("Take Photo")
+                    if (profileBitmap != null) {
+                        TextButton(
+                            enabled = !isSavingProfile,
+                            onClick = {
+                                showProfilePicker = false
+                                saveProfilePhoto(null)
+                            }
+                        ) {
+                            Text("Remove", color = Color(0xFFDC2626))
+                        }
+                    }
                 }
             }
         )
@@ -3147,9 +4112,11 @@ fun NavTabItemComposable(
     activeIcon: ImageVector,
     inactiveIcon: ImageVector,
     isSelected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Surface(
+        modifier = modifier,
         onClick = onClick,
         color = if (isSelected) EcoHomeTabYellow else Color.Transparent,
         shape = RoundedCornerShape(16.dp)
@@ -3539,12 +4506,13 @@ fun NotificationCardItem(
 @Composable
 fun ProfileMenuRow(
     icon: ImageVector,
-    title: String
+    title: String,
+    onClick: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { }
+            .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween

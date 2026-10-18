@@ -19,6 +19,11 @@ const userSchema = new mongoose.Schema({
     lowercase: true,
     default: ''
   },
+  facebookId: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
   barangay: {
     type: String,
     required: [true, 'Barangay is required'],

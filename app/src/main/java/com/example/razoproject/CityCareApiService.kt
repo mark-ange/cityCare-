@@ -9,10 +9,52 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
+
+data class CityCareCollectionSchedule(
+    val barangay: String,
+    val biodegradableDays: String,
+    val nonBiodegradableDays: String,
+    val timeSlot: String,
+    val assignedTruck: String,
+    val areaSchedules: List<CityCareAreaCollectionSchedule>
+)
+
+data class CityCareAreaCollectionSchedule(
+    val areaName: String,
+    val appliesToAllAreas: Boolean,
+    val isSample: Boolean,
+    val biodegradableDays: String,
+    val nonBiodegradableDays: String,
+    val timeSlot: String,
+    val assignedTruck: String
+)
+
+data class CityCareContentImage(
+    val id: String,
+    val url: String,
+    val name: String,
+    val mimeType: String
+)
+
+data class CityCareCommunityContent(
+    val id: String,
+    val type: String,
+    val title: String,
+    val summary: String,
+    val body: String,
+    val imageUrl: String,
+    val sourceUrl: String,
+    val images: List<CityCareContentImage>,
+    val eventStartAt: String,
+    val eventEndAt: String,
+    val location: String
+)
 
 /**
  * REST API Client for CityCare CDO Backend Service (Node.js / Express & MongoDB).
@@ -20,8 +62,8 @@ import java.net.URL
  */
 object CityCareApiService {
 
-    // Update this address when the development computer joins a different network.
-    var BASE_URL = "http://192.168.0.103:5000/api"
+    // For remote use, replace this LAN address with the deployed API's HTTPS URL.
+    var BASE_URL = "http://192.168.1.8:5000/api"
 
     var authToken: String? = null
     var isOnline: Boolean = true
@@ -32,6 +74,8 @@ object CityCareApiService {
     var currentUserEmail: String = "resident@citycare.com"
     var currentUserPhone: String = "0917 123 4567"
     var currentUserLocation: String = "Barangay Carmen, Zone 3"
+    var currentUserBarangay: String = "Carmen"
+    var currentUserPurok: String = "Zone 3"
     var currentUserPhotoUrl: String? = null
 
     fun setCurrentUser(
@@ -39,12 +83,20 @@ object CityCareApiService {
         email: String,
         phone: String = "",
         location: String = "Barangay Carmen, Zone 3",
-        photoUrl: String? = null
+        barangay: String = "",
+        purok: String = "",
+        photoUrl: String? = currentUserPhotoUrl
     ) {
         currentUserName = name.ifEmpty { email.substringBefore("@") }.trim()
         currentUserEmail = email.ifEmpty { "resident@citycare.com" }.trim()
         currentUserPhone = phone.ifEmpty { "0917 123 4567" }.trim()
-        currentUserLocation = location.ifEmpty { "Barangay Carmen, Zone 3" }.trim()
+        currentUserBarangay = barangay.ifEmpty {
+            location.substringAfter("Barangay ", "").substringBefore(",").ifEmpty { "Carmen" }
+        }.trim()
+        currentUserPurok = purok.ifEmpty {
+            location.substringAfter(",", "").trim().ifEmpty { "Zone 3" }
+        }.trim()
+        currentUserLocation = "Barangay $currentUserBarangay, $currentUserPurok"
         currentUserPhotoUrl = photoUrl
     }
 
@@ -58,8 +110,13 @@ object CityCareApiService {
                 .putString("user_email", currentUserEmail)
                 .putString("user_phone", currentUserPhone)
                 .putString("user_location", currentUserLocation)
+                .putString("user_barangay", currentUserBarangay)
+                .putString("user_purok", currentUserPurok)
                 .putString("user_photo_url", currentUserPhotoUrl)
                 .apply()
+            if (currentUserPhotoUrl != null) {
+                saveAccountProfilePhoto(context, currentUserEmail, currentUserPhotoUrl)
+            }
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -75,7 +132,10 @@ object CityCareApiService {
                 currentUserEmail = prefs.getString("user_email", "resident@citycare.com") ?: "resident@citycare.com"
                 currentUserPhone = prefs.getString("user_phone", "0917 123 4567") ?: "0917 123 4567"
                 currentUserLocation = prefs.getString("user_location", "Barangay Carmen, Zone 3") ?: "Barangay Carmen, Zone 3"
+                currentUserBarangay = prefs.getString("user_barangay", "Carmen") ?: "Carmen"
+                currentUserPurok = prefs.getString("user_purok", "Zone 3") ?: "Zone 3"
                 currentUserPhotoUrl = prefs.getString("user_photo_url", null)
+                    ?: loadAccountProfilePhoto(context, currentUserEmail)
                 return true
             }
         } catch (e: Exception) {
@@ -83,6 +143,98 @@ object CityCareApiService {
         }
         return false
     }
+
+    private fun profilePhotoPreferenceKey(email: String): String =
+        "profile_photo_${email.trim().lowercase()}"
+
+    private fun saveAccountProfilePhoto(context: Context, email: String, photoData: String?) {
+        val prefs = context.getSharedPreferences("citycare_profile_media", Context.MODE_PRIVATE)
+        prefs.edit().putString(profilePhotoPreferenceKey(email), photoData).apply()
+    }
+
+    private fun loadAccountProfilePhoto(context: Context, email: String): String? =
+        context.getSharedPreferences("citycare_profile_media", Context.MODE_PRIVATE)
+            .getString(profilePhotoPreferenceKey(email), null)
+
+    fun loadCurrentProfilePhoto(context: Context): android.graphics.Bitmap? {
+        val photoData = currentUserPhotoUrl ?: loadAccountProfilePhoto(context, currentUserEmail)
+        if (photoData.isNullOrBlank()) return null
+        currentUserPhotoUrl = photoData
+        return base64ToBitmap(photoData)
+    }
+
+    suspend fun updateProfilePhoto(context: Context, bitmap: android.graphics.Bitmap?): Pair<Boolean, String> =
+        withContext(Dispatchers.IO) {
+            val photoData = bitmap?.let { source ->
+                val maxDimension = 512
+                val scale = minOf(1f, maxDimension.toFloat() / maxOf(source.width, source.height))
+                val resized = if (scale < 1f) {
+                    android.graphics.Bitmap.createScaledBitmap(
+                        source,
+                        (source.width * scale).toInt().coerceAtLeast(1),
+                        (source.height * scale).toInt().coerceAtLeast(1),
+                        true
+                    )
+                } else {
+                    source
+                }
+                val output = java.io.ByteArrayOutputStream()
+                resized.compress(android.graphics.Bitmap.CompressFormat.JPEG, 65, output)
+                android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP)
+            }.orEmpty()
+
+            if (bitmap != null && photoData.isBlank()) {
+                return@withContext false to "Could not prepare the selected photo. Please choose another image."
+            }
+
+            saveAccountProfilePhoto(context, currentUserEmail, photoData.ifBlank { null })
+            currentUserPhotoUrl = photoData.ifBlank { null }
+            saveUserSession(context)
+
+            val token = authToken
+            if (token.isNullOrBlank()) {
+                return@withContext true to if (photoData.isBlank()) {
+                    "Profile photo removed from this device."
+                } else {
+                    "Profile photo saved on this device. Sign in online to sync it to your account."
+                }
+            }
+
+            try {
+                val connection = (URL("$BASE_URL/auth/profile").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "PUT"
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Authorization", "Bearer $token")
+                    connectTimeout = 8000
+                    readTimeout = 8000
+                }
+                val payload = JSONObject().put("profilePhoto", photoData).toString()
+                OutputStreamWriter(connection.outputStream).use { it.write(payload) }
+
+                val responseCode = connection.responseCode
+                val responseStream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+                val responseText = responseStream?.let {
+                    BufferedReader(InputStreamReader(it)).use { reader -> reader.readText() }
+                }.orEmpty()
+                connection.disconnect()
+
+                if (responseCode !in 200..299) {
+                    val message = runCatching { JSONObject(responseText).optString("message") }.getOrNull()
+                    return@withContext true to "Photo saved on this device, but account sync failed: ${
+                        message?.takeIf { it.isNotBlank() } ?: "HTTP $responseCode"
+                    }"
+                }
+                true to if (photoData.isBlank()) {
+                    "Profile photo removed from your account."
+                } else {
+                    "Profile photo saved to your account."
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                true to "Photo saved on this device, but account sync failed. Check your connection and try again."
+            }
+        }
 
     fun clearUserSession(context: Context) {
         try {
@@ -93,6 +245,8 @@ object CityCareApiService {
             currentUserEmail = "resident@citycare.com"
             currentUserPhone = "0917 123 4567"
             currentUserLocation = "Barangay Carmen, Zone 3"
+            currentUserBarangay = "Carmen"
+            currentUserPurok = "Zone 3"
             currentUserPhotoUrl = null
         } catch (e: Exception) {
             e.printStackTrace()
@@ -395,7 +549,11 @@ object CityCareApiService {
         val cleanName = account.name.trim()
         val cleanPass = account.password.trim()
         val cleanEmail = account.email.trim().lowercase()
-        val cleanPhone = account.phoneNumber.ifEmpty { cleanId }.trim()
+        val cleanPhone = if (account.phoneNumber.isNotBlank()) {
+            account.phoneNumber.trim()
+        } else {
+            "0917" + (1000000..9999999).random()
+        }
 
         registeredAccounts.add(account)
 
@@ -409,16 +567,14 @@ object CityCareApiService {
                 readTimeout = 3000
             }
 
-            val jsonPayload = """
-                {
-                    "fullName": "${cleanName.replace("\"", "\\\"")}",
-                    "phoneNumber": "${cleanPhone.replace("\"", "\\\"")}",
-                    "email": "${cleanEmail.replace("\"", "\\\"")}",
-                    "barangay": "${account.barangay.replace("\"", "\\\"")}",
-                    "purokZone": "${account.purok.replace("\"", "\\\"")}",
-                    "password": "${cleanPass.replace("\"", "\\\"")}"
-                }
-            """.trimIndent()
+            val jsonPayload = JSONObject()
+                .put("fullName", cleanName)
+                .put("phoneNumber", cleanPhone)
+                .put("email", cleanEmail)
+                .put("barangay", account.barangay)
+                .put("purokZone", account.purok)
+                .put("password", cleanPass)
+                .toString()
 
             OutputStreamWriter(connection.outputStream).use { writer ->
                 writer.write(jsonPayload)
@@ -431,6 +587,16 @@ object CityCareApiService {
             connection.disconnect()
 
             if (responseCode == 201) {
+                val response = JSONObject(responseText)
+                val user = response.optJSONObject("data") ?: JSONObject()
+                authToken = response.optString("token").takeIf { it.isNotBlank() }
+                setCurrentUser(
+                    name = user.optString("fullName", cleanName),
+                    email = user.optString("email", cleanEmail),
+                    phone = user.optString("phoneNumber", cleanPhone),
+                    barangay = user.optString("barangay", account.barangay),
+                    purok = user.optString("purokZone", account.purok)
+                )
                 Pair(true, "Registration Successful! Account created.")
             } else if (responseCode == 409) {
                 Pair(false, "Conflict: Phone or Email is already registered in database.")
@@ -439,9 +605,130 @@ object CityCareApiService {
             }
         } catch (e: Exception) {
             e.printStackTrace()
+            setCurrentUser(
+                name = cleanName,
+                email = cleanEmail,
+                phone = cleanPhone,
+                barangay = account.barangay,
+                purok = account.purok
+            )
             Pair(true, "Resident registered locally (Offline Mode).")
         }
     }
+
+    suspend fun updateUserProfile(
+        context: Context,
+        name: String,
+        email: String,
+        phone: String,
+        barangay: String,
+        purok: String
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        val cleanName = name.trim()
+        val cleanEmail = email.trim().lowercase()
+        val cleanPhone = phone.trim()
+        val cleanBarangay = barangay.trim()
+        val cleanPurok = purok.trim()
+
+        if (cleanName.isEmpty() || cleanEmail.isEmpty() || cleanPhone.isEmpty() ||
+            cleanBarangay.isEmpty() || cleanPurok.isEmpty()
+        ) {
+            return@withContext false to "Please complete all profile fields."
+        }
+
+        val token = authToken
+        if (!token.isNullOrBlank()) {
+            try {
+                val connection = (URL("$BASE_URL/auth/profile").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "PUT"
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Authorization", "Bearer $token")
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                }
+
+                val payload = JSONObject()
+                    .put("fullName", cleanName)
+                    .put("email", cleanEmail)
+                    .put("phoneNumber", cleanPhone)
+                    .put("barangay", cleanBarangay)
+                    .put("purokZone", cleanPurok)
+                OutputStreamWriter(connection.outputStream).use { it.write(payload.toString()) }
+
+                val responseCode = connection.responseCode
+                val responseStream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+                val responseText = responseStream?.let { BufferedReader(InputStreamReader(it)).use { reader -> reader.readText() } }.orEmpty()
+                connection.disconnect()
+
+                if (responseCode !in 200..299) {
+                    val message = runCatching { JSONObject(responseText).optString("message") }.getOrNull()
+                    return@withContext false to message?.takeIf { it.isNotBlank() }
+                        .orEmpty().ifBlank { "Profile update failed (HTTP $responseCode)." }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                return@withContext false to "Could not sync profile changes. Check your connection and try again."
+            }
+        }
+
+        setCurrentUser(
+            name = cleanName,
+            email = cleanEmail,
+            phone = cleanPhone,
+            barangay = cleanBarangay,
+            purok = cleanPurok
+        )
+        saveUserSession(context)
+        if (token.isNullOrBlank()) {
+            true to "Saved on this device. Sign in online to sync your profile to your account."
+        } else {
+            true to "Profile updated and synced to your account."
+        }
+    }
+
+    suspend fun changeUserPassword(currentPassword: String, newPassword: String): Pair<Boolean, String> =
+        withContext(Dispatchers.IO) {
+            val token = authToken
+            if (token.isNullOrBlank()) {
+                return@withContext false to "Sign in online before changing your account password."
+            }
+            if (currentPassword.isBlank() || newPassword.length < 6) {
+                return@withContext false to "Enter your current password and a new password with at least 6 characters."
+            }
+
+            try {
+                val connection = (URL("$BASE_URL/auth/change-password").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "PUT"
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Authorization", "Bearer $token")
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                }
+                val payload = JSONObject()
+                    .put("currentPassword", currentPassword)
+                    .put("newPassword", newPassword)
+                OutputStreamWriter(connection.outputStream).use { it.write(payload.toString()) }
+
+                val responseCode = connection.responseCode
+                val responseStream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+                val responseText = responseStream?.let {
+                    BufferedReader(InputStreamReader(it)).use { reader -> reader.readText() }
+                }.orEmpty()
+                connection.disconnect()
+                val response = runCatching { JSONObject(responseText) }.getOrNull()
+                if (responseCode in 200..299) {
+                    true to response?.optString("message").orEmpty().ifBlank { "Password changed successfully." }
+                } else {
+                    false to response?.optString("message").orEmpty()
+                        .ifBlank { "Password change failed (HTTP $responseCode)." }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false to "Could not change password. Check your connection and try again."
+            }
+        }
 
     /**
      * Automatic Social / Google OAuth Login & MongoDB Auto-Registration using real Google Profile data
@@ -460,7 +747,8 @@ object CityCareApiService {
             name = cleanName,
             email = cleanEmail,
             phone = "",
-            location = "Barangay Carmen, Zone 3",
+            barangay = "Carmen",
+            purok = "Zone 3",
             photoUrl = photoUrl
         )
 
@@ -481,6 +769,58 @@ object CityCareApiService {
             loginUserOnline(cleanEmail, "google_oauth_pass")
         }
         return@withContext true
+    }
+
+    suspend fun loginWithFacebookAccessToken(
+        accessToken: String,
+        context: Context
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        if (accessToken.isBlank()) {
+            return@withContext false to "Facebook did not return an access token."
+        }
+
+        try {
+            val connection = (URL("$BASE_URL/auth/facebook").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 10000
+                readTimeout = 10000
+            }
+            val payload = JSONObject().put("accessToken", accessToken).toString()
+            OutputStreamWriter(connection.outputStream).use { it.write(payload) }
+
+            val responseCode = connection.responseCode
+            val responseStream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+            val responseText = responseStream?.let {
+                BufferedReader(InputStreamReader(it)).use { reader -> reader.readText() }
+            }.orEmpty()
+            connection.disconnect()
+
+            val response = runCatching { JSONObject(responseText) }.getOrNull()
+            if (responseCode !in 200..299) {
+                return@withContext false to response?.optString("message").orEmpty()
+                    .ifBlank { "Facebook sign-in failed (HTTP $responseCode)." }
+            }
+
+            val user = response?.optJSONObject("data")
+                ?: return@withContext false to "Facebook sign-in returned incomplete account data."
+            authToken = response.optString("token").takeIf { it.isNotBlank() }
+                ?: return@withContext false to "Facebook sign-in did not return an account session."
+            setCurrentUser(
+                name = user.optString("fullName", "Facebook Resident"),
+                email = user.optString("email", ""),
+                phone = user.optString("phoneNumber", ""),
+                barangay = user.optString("barangay", "Carmen"),
+                purok = user.optString("purokZone", "Zone 3"),
+                photoUrl = user.optString("profilePhoto").takeIf { it.isNotBlank() }
+            )
+            saveUserSession(context)
+            true to "Facebook sign-in successful."
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false to "Could not verify your Facebook account with CityCare. Check your connection and try again."
+        }
     }
 
     /**
@@ -537,8 +877,25 @@ object CityCareApiService {
             }
 
             val responseCode = connection.responseCode
+            val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+            val responseText = stream?.let { BufferedReader(InputStreamReader(it)).use { reader -> reader.readText() } }.orEmpty()
             connection.disconnect()
-            responseCode in 200..299
+            if (responseCode !in 200..299) return@withContext false
+
+            val response = JSONObject(responseText)
+            authToken = response.optString("token").takeIf { it.isNotBlank() }
+            val user = response.optJSONObject("data")
+            if (user != null) {
+                setCurrentUser(
+                    name = user.optString("fullName", currentUserName),
+                    email = user.optString("email", currentUserEmail),
+                    phone = user.optString("phoneNumber", currentUserPhone),
+                    barangay = user.optString("barangay", currentUserBarangay),
+                    purok = user.optString("purokZone", currentUserPurok),
+                    photoUrl = user.optString("profilePhoto").takeIf { it.isNotBlank() }
+                )
+            }
+            true
         } catch (e: Exception) {
             isValidCredential(cleanId, cleanPass)
         }
@@ -724,50 +1081,196 @@ object CityCareApiService {
         return result
     }
 
-    /**
-     * Fetches barangay waste collection schedule from Node.js Express backend API (/api/schedules)
-     */
-    suspend fun fetchSchedulesFromCloud(barangay: String = "Carmen"): String = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val url = URL("$BASE_URL/schedules?barangay=$barangay")
-            val connection = (url.openConnection() as HttpURLConnection).apply {
+    suspend fun fetchSchedulesFromCloud(barangay: String? = null): List<CityCareCollectionSchedule> =
+        withContext(Dispatchers.IO) {
+            val encodedBarangay = barangay?.let { URLEncoder.encode(it, "UTF-8") }
+            val query = encodedBarangay?.let { "?barangay=$it" }.orEmpty()
+            val connection = (URL("$BASE_URL/schedules$query").openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 3000
-                readTimeout = 3000
+                connectTimeout = 5000
+                readTimeout = 5000
             }
 
-            val responseCode = connection.responseCode
-            if (responseCode in 200..299) {
-                val responseText = BufferedReader(InputStreamReader(connection.inputStream)).use { it.readText() }
-                connection.disconnect()
-                parseScheduleJson(responseText)
-            } else {
-                connection.disconnect()
-                "MWF - Biodegradable\nTTHS - Non-Bio"
-            }
-        } catch (e: Exception) {
-            "MWF - Biodegradable\nTTHS - Non-Bio"
-        }
-    }
-
-    private fun parseScheduleJson(jsonString: String): String {
-        try {
-            val jsonObject = JSONObject(jsonString)
-            if (jsonObject.has("data")) {
-                val dataArray = jsonObject.getJSONArray("data")
-                if (dataArray.length() > 0) {
-                    val item = dataArray.getJSONObject(0)
-                    val bio = item.optString("biodegradableDays", "Monday, Wednesday, Friday")
-                    val nonBio = item.optString("nonBiodegradableDays", "Tuesday, Thursday, Saturday")
-                    val time = item.optString("timeSlot", "06:00 AM - 10:00 AM")
-                    return "Bio: $bio\nNon-Bio: $nonBio\nTime: $time"
+            try {
+                val responseCode = connection.responseCode
+                if (responseCode !in 200..299) {
+                    throw IOException("Schedule request failed with HTTP $responseCode")
                 }
+
+                val responseText = BufferedReader(InputStreamReader(connection.inputStream)).use {
+                    it.readText()
+                }
+                val response = JSONObject(responseText)
+                if (!response.optBoolean("success", false)) {
+                    throw IOException(response.optString("message", "Could not load collection schedules"))
+                }
+
+                val scheduleData = response.optJSONArray("data") ?: JSONArray()
+                buildList {
+                    for (index in 0 until scheduleData.length()) {
+                        val item = scheduleData.optJSONObject(index) ?: continue
+                        val areaData = item.optJSONArray("areaSchedules") ?: JSONArray()
+                        val areaSchedules = buildList {
+                            for (areaIndex in 0 until areaData.length()) {
+                                val area = areaData.optJSONObject(areaIndex) ?: continue
+                                val areaName = area.optString("areaName").trim()
+                                if (areaName.isNotBlank()) {
+                                    add(
+                                        CityCareAreaCollectionSchedule(
+                                            areaName = areaName,
+                                            appliesToAllAreas = area.optBoolean("appliesToAllAreas", false),
+                                            isSample = area.optBoolean("isSample", false),
+                                            biodegradableDays = area.optString("biodegradableDays").trim(),
+                                            nonBiodegradableDays = area.optString("nonBiodegradableDays").trim(),
+                                            timeSlot = area.optString("timeSlot").trim(),
+                                            assignedTruck = area.optString("assignedTruck").trim()
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                        add(
+                            CityCareCollectionSchedule(
+                                barangay = item.optString("barangay").trim(),
+                                biodegradableDays = item.optString("biodegradableDays").trim(),
+                                nonBiodegradableDays = item.optString("nonBiodegradableDays").trim(),
+                                timeSlot = item.optString("timeSlot").trim(),
+                                assignedTruck = item.optString("assignedTruck").trim(),
+                                areaSchedules = areaSchedules
+                            )
+                        )
+                    }
+                }.filter { it.barangay.isNotBlank() }
+            } finally {
+                connection.disconnect()
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
-        return "MWF - Biodegradable\nTTHS - Non-Bio"
-    }
+
+    suspend fun fetchCommunityContent(type: String): List<CityCareCommunityContent> =
+        withContext(Dispatchers.IO) {
+            val supportedTypes = setOf("recycle", "event", "tip", "blog")
+            require(type in supportedTypes) { "Unsupported community content type." }
+
+            val encodedType = URLEncoder.encode(type, "UTF-8")
+            val connection = (URL("$BASE_URL/content?type=$encodedType").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10000
+                readTimeout = 15000
+            }
+
+            try {
+                val responseCode = connection.responseCode
+                val responseStream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+                val responseText = responseStream?.let { stream ->
+                    BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+                }.orEmpty()
+                if (responseCode !in 200..299) {
+                    val message = runCatching { JSONObject(responseText).optString("message") }.getOrNull()
+                    throw IOException(message?.takeIf { it.isNotBlank() } ?: "Content request failed with HTTP $responseCode.")
+                }
+
+                val response = JSONObject(responseText)
+                if (!response.optBoolean("success", false)) {
+                    throw IOException(response.optString("message").ifBlank { "Could not load community content." })
+                }
+
+                val contentData = response.optJSONArray("data") ?: JSONArray()
+                buildList {
+                    for (index in 0 until contentData.length()) {
+                        val item = contentData.optJSONObject(index) ?: continue
+                        val imagesJson = item.optJSONArray("images") ?: JSONArray()
+                        val images = buildList {
+                            for (imageIndex in 0 until imagesJson.length()) {
+                                val image = imagesJson.optJSONObject(imageIndex) ?: continue
+                                val url = image.optString("url").trim()
+                                if (url.isNotBlank()) {
+                                    add(
+                                        CityCareContentImage(
+                                            id = image.optString("id"),
+                                            url = url,
+                                            name = image.optString("name"),
+                                            mimeType = image.optString("mimeType")
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                        add(
+                            CityCareCommunityContent(
+                                id = item.optString("_id"),
+                                type = item.optString("type"),
+                                title = item.optString("title"),
+                                summary = item.optString("summary"),
+                                body = item.optString("body"),
+                                imageUrl = item.optString("imageUrl")
+                                    .trim()
+                                    .takeIf { it.startsWith("https://", ignoreCase = true) }
+                                    .orEmpty(),
+                                sourceUrl = item.optString("sourceUrl")
+                                    .trim()
+                                    .takeUnless { it.isBlank() || it.equals("null", ignoreCase = true) }
+                                    .orEmpty(),
+                                images = images,
+                                eventStartAt = item.optString("eventStartAt").takeUnless { it == "null" }.orEmpty(),
+                                eventEndAt = item.optString("eventEndAt").takeUnless { it == "null" }.orEmpty(),
+                                location = item.optString("location")
+                            )
+                        )
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        }
+
+    suspend fun fetchCommunityImage(imagePath: String): android.graphics.Bitmap =
+        withContext(Dispatchers.IO) {
+            val imageUrl = URL(URL(BASE_URL), imagePath)
+            require(imageUrl.protocol == "https" || imageUrl.protocol == "http") {
+                "The community image URL uses an unsupported protocol."
+            }
+            val connection = (imageUrl.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10000
+                readTimeout = 15000
+            }
+            try {
+                val responseCode = connection.responseCode
+                if (responseCode !in 200..299) {
+                    throw IOException("Image request failed with HTTP $responseCode.")
+                }
+                val bytes = connection.inputStream.use { input ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    var totalBytes = 0
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        totalBytes += read
+                        if (totalBytes > 2 * 1024 * 1024) {
+                            throw IOException("Image exceeds the 2 MB download limit.")
+                        }
+                        output.write(buffer, 0, read)
+                    }
+                    output.toByteArray()
+                }
+                val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                    throw IOException("The content image could not be decoded.")
+                }
+                val maxDimension = 1600
+                var sampleSize = 1
+                while (bounds.outWidth / sampleSize > maxDimension || bounds.outHeight / sampleSize > maxDimension) {
+                    sampleSize *= 2
+                }
+                val options = android.graphics.BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+                    ?: throw IOException("The content image could not be decoded.")
+            } finally {
+                connection.disconnect()
+            }
+        }
 
     /**
      * Fetches user notifications from Node.js Express backend API (/api/notifications)
