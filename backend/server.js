@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const path = require('path');
 const connectDB = require('./config/db');
+const { connectReportDB } = require('./config/reportDb');
 
 // Load environment variables
 dotenv.config();
@@ -37,6 +38,7 @@ app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/reports', require('./routes/reportRoutes'));
 app.use('/api/schedules', require('./routes/scheduleRoutes'));
 app.use('/api/notifications', require('./routes/notificationRoutes'));
+app.use('/api/content', require('./routes/contentRoutes'));
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -44,10 +46,11 @@ app.get('/', (req, res) => {
 });
 
 // Port configuration
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 async function startServer() {
   await connectDB();
+  await connectReportDB();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`====================================================`);

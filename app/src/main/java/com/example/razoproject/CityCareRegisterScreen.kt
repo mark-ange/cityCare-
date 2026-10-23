@@ -56,7 +56,7 @@ fun CityCareRegisterScreen(
     val barangayList = listOf("Iponan", "Bulua", "Canitoan", "Carmen", "Patag", "Kauswagan")
 
     Scaffold(
-        containerColor = Color(0xFFF8FAFC),
+        containerColor = MaterialTheme.colorScheme.background,
         contentWindowInsets = WindowInsets.systemBars
     ) { paddingValues ->
         LazyColumn(

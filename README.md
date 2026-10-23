@@ -11,30 +11,32 @@ Native Android app for CityCare CDO residents to submit waste reports and follow
 
 - Android Studio with the Android SDK for building and installing the app.
 - JDK 17 (Android Studio's bundled JBR is suitable).
-- Node.js 16 or later for the API.
+- Node.js 18 or later for the API.
 - MongoDB Atlas or another reachable MongoDB database.
 
 ## Configure the API
 
-1. Start the CityCare API backend and confirm `http://<COMPUTER_LAN_IP>:5000/api/health` returns `ONLINE` and `CONNECTED`. Keep MongoDB credentials on the backend only; never put them in the Android app.
-2. Set `CityCareApiService.BASE_URL` in `app/src/main/java/com/example/razoproject/CityCareApiService.kt`:
+1. Start the Android project's API backend from the repository root with `npm --prefix backend start`. Its private `backend/.env` must use a reachable MongoDB URI (Atlas or another hosted MongoDB; `localhost` only works if MongoDB is installed and running locally) and set `MONGO_REPORT_DATABASE=citycare_db` so the admin portal and resident app share reports, collection schedules, and published community content. The API listens on port `5001`. The web frontend is optional and is not needed for mobile sign-in. Confirm `http://localhost:5001/api/health` returns `ONLINE` and `CONNECTED`. Keep MongoDB credentials on the backend only; never put them in the Android app.
+2. The app's default API address is `http://10.0.2.2:5001/api` for an Android emulator. For a physical phone, start an HTTPS tunnel to port `5001` or use the computer's reachable Wi-Fi address, then tap **Server settings** on the sign-in screen and enter that API address. The backend and tunnel must remain running while the phone uses the app. The resident API stores reports in `citycare_db`, which is also used by the web-admin backend, so submitted reports are available in the admin portal.
 
    ```powershell
-   var BASE_URL = "http://<COMPUTER_LAN_IP>:5000/api"
+   # Android emulator using a backend running on this computer
+   .\gradlew.bat assembleDebug -PCITYCARE_API_URL=http://10.0.2.2:5001/api
    ```
 
-   - This checkout currently uses `http://192.168.1.8:5000/api`; replace that LAN IP if the computer changes networks or receives a new address. Reserve the computer's LAN address in the router so it does not change.
-   - Android emulator using an API on the same computer: `http://10.0.2.2:5000/api`
+   - For local Wi-Fi only, pass `-PCITYCARE_API_URL=http://<COMPUTER_LAN_IP>:5001/api` when building.
    - Deployed API: use its HTTPS address, such as `https://<API_HOST>/api`.
 
-3. For a physical phone, connect it and the computer to the same Wi-Fi, allow inbound TCP port `5000` through Windows Firewall on Private networks, then rebuild and reinstall the app after changing the URL.
-4. A local API address works only while the API computer is on and reachable. MongoDB Atlas hosts the database, not the API. For a deployed API, configure the HTTPS address above.
+3. A phone using an HTTPS tunnel does not need to be on the same Wi-Fi as this computer. The computer must stay on, with the Android backend and tunnel running. Port `5000` may be used by the separate web-admin backend.
+4. A local API address works only while the API computer is on and reachable. MongoDB Atlas hosts the database, not the API. For a deployed API, enter its HTTPS `/api` address in **Server settings**.
 5. Add `app/google-services.json` if building the Firebase-enabled app. Obtain it from Firebase project settings and keep it out of version control.
-6. To enable Facebook sign-in:
+6. Google sign-in sends its ID token to the API for verification. Set `GOOGLE_CLIENT_ID` in `backend/.env` to the same Web OAuth client ID used by the app's `.requestIdToken(...)` configuration.
+7. To enable Facebook sign-in:
    - Create/configure a Facebook app with the Facebook Login product. Add the Android package `com.example.razoproject` and the signing-key hashes used for your debug/release builds.
    - Add `FACEBOOK_APP_ID` and `FACEBOOK_CLIENT_TOKEN` to `%USERPROFILE%\.gradle\gradle.properties`; rebuild and reinstall the Android app.
-   - Set the same `FACEBOOK_APP_ID` and the private `FACEBOOK_APP_SECRET` in `backend/.env`. Never put the app secret in Android/Gradle properties or commit it.
-   - Restart the backend. The API validates each Facebook access token with Facebook before creating or signing in to a CityCare account. Use HTTPS for a deployed API; do not send access tokens over public plain HTTP.
+   - Replace the example values in `backend/.env.example` with the same `FACEBOOK_APP_ID` and the private `FACEBOOK_APP_SECRET` in `backend/.env`. Never put the app secret in Android/Gradle properties or commit it.
+   - Restart the backend after setting both values. If the app reports that Facebook sign-in is not configured on the server, the backend is missing one or both values or is still running with its old environment.
+   - The API validates each Facebook access token with Facebook before creating or signing in to a CityCare account. Use HTTPS for a deployed API; do not send access tokens over public plain HTTP.
    - Facebook accounts in Development mode can only sign in if they have a role on the Facebook app. Request the required permissions/review and make the app available to users before production.
    - Add `MAPS_API_KEY` to Gradle properties if enabling Google Maps.
 

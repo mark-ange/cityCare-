@@ -1,11 +1,19 @@
 package com.example.razoproject
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -13,6 +21,7 @@ import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
 
@@ -56,14 +65,150 @@ data class CityCareCommunityContent(
     val location: String
 )
 
+data class CityCareNotification(
+    val id: String,
+    val title: String,
+    val body: String,
+    val type: String,
+    val isRead: Boolean,
+    val time: String
+)
+
 /**
  * REST API Client for CityCare CDO Backend Service (Node.js / Express & MongoDB).
  * Exclusively handles resident registration, strict citizen authentication, and report submissions.
  */
 object CityCareApiService {
 
-    // For remote use, replace this LAN address with the deployed API's HTTPS URL.
-    var BASE_URL = "http://192.168.1.8:5000/api"
+    @Volatile
+    var BASE_URL = BuildConfig.CITYCARE_API_URL
+
+    private const val API_SETTINGS_PREFERENCES = "citycare_api_settings"
+    private const val API_BASE_URL_KEY = "api_base_url"
+    private const val API_CONFIG_VERSION_KEY = "api_config_version"
+    private const val API_CONFIG_VERSION = 5
+
+    fun loadApiBaseUrl(context: Context) {
+        val preferences = context.getSharedPreferences(API_SETTINGS_PREFERENCES, Context.MODE_PRIVATE)
+        val savedUrl = preferences.getString(API_BASE_URL_KEY, null)
+        val previousConfigVersion = preferences.getInt(API_CONFIG_VERSION_KEY, 1)
+        val savedHost = savedUrl?.let { runCatching { URI(it).host?.lowercase() }.getOrNull() }
+        val defaultHost = runCatching { URI(BuildConfig.CITYCARE_API_URL).host?.lowercase() }.getOrNull()
+        val migrateExpiredTunnelUrl = previousConfigVersion < API_CONFIG_VERSION &&
+            savedHost == "breeding-mayflower-radiator.ngrok-free.dev"
+        val migrateEmulatorUrl = previousConfigVersion < API_CONFIG_VERSION &&
+            savedHost == "10.0.2.2" &&
+            defaultHost != "10.0.2.2"
+        val migrateLocalUrl = previousConfigVersion < API_CONFIG_VERSION &&
+            savedUrl != null &&
+            isLocalApiUrl(savedUrl) &&
+            BuildConfig.CITYCARE_API_URL.startsWith("https://", ignoreCase = true)
+        val selectedUrl = if (migrateExpiredTunnelUrl || migrateEmulatorUrl || migrateLocalUrl) {
+            BuildConfig.CITYCARE_API_URL
+        }
+        else savedUrl ?: BuildConfig.CITYCARE_API_URL
+        BASE_URL = normalizeApiBaseUrl(selectedUrl)
+            ?: BuildConfig.CITYCARE_API_URL
+        preferences.edit().apply {
+            putInt(API_CONFIG_VERSION_KEY, API_CONFIG_VERSION)
+            if (migrateExpiredTunnelUrl || migrateEmulatorUrl || migrateLocalUrl) {
+                remove(API_BASE_URL_KEY)
+            }
+        }.apply()
+    }
+
+    fun saveApiBaseUrl(context: Context, value: String): Pair<Boolean, String> {
+        val normalizedUrl = normalizeApiBaseUrl(value)
+            ?: return false to "Enter a valid http:// or https:// server address."
+
+        BASE_URL = normalizedUrl
+        context.getSharedPreferences(API_SETTINGS_PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putString(API_BASE_URL_KEY, normalizedUrl)
+            .putInt(API_CONFIG_VERSION_KEY, API_CONFIG_VERSION)
+            .apply()
+        return true to "Server address saved."
+    }
+
+    private fun isLocalApiUrl(value: String): Boolean {
+        val host = runCatching { URI(value).host?.lowercase() }.getOrNull() ?: return false
+        if (host == "localhost" || host.endsWith(".local")) return true
+        val octets = host.split(".").mapNotNull { it.toIntOrNull() }
+        if (octets.size != 4 || octets.any { it !in 0..255 }) return false
+        return octets[0] == 10 ||
+            octets[0] == 127 ||
+            (octets[0] == 169 && octets[1] == 254) ||
+            (octets[0] == 172 && octets[1] in 16..31) ||
+            (octets[0] == 192 && octets[1] == 168)
+    }
+
+    suspend fun checkApiConnection(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        val connection = try {
+            (URL("$BASE_URL/health").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 5000
+            }
+        } catch (e: Exception) {
+            return@withContext false to "Could not open the server address: ${e.message ?: "invalid URL"}"
+        }
+
+        try {
+            val responseCode = connection.responseCode
+            val responseStream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+            val responseText = responseStream?.use { stream ->
+                BufferedReader(InputStreamReader(stream)).use { it.readText() }
+            }.orEmpty()
+            val health = runCatching { JSONObject(responseText) }.getOrNull()
+            val databaseStatus = health?.optString("database").orEmpty()
+            val msg = health?.optString("message").orEmpty().ifBlank { "CityCare API returned HTTP $responseCode." }
+            if (responseCode in 200..299 &&
+                health?.optString("status") == "ONLINE" &&
+                databaseStatus == "CONNECTED"
+            ) {
+                true to "Connected to CityCare API and MongoDB."
+            } else if (databaseStatus.isNotBlank()) {
+                false to "CityCare API responded, but database status is $databaseStatus."
+            } else {
+                false to msg
+            }
+        } catch (e: Exception) {
+            false to "Could not reach $BASE_URL: ${e.message ?: "network unavailable"}"
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun normalizeApiBaseUrl(value: String): String? {
+        val trimmed = value.trim().trimEnd('/')
+        val parsed = runCatching { URI(trimmed) }.getOrNull() ?: return null
+        if (parsed.scheme !in setOf("http", "https") ||
+            parsed.host.isNullOrBlank() ||
+            parsed.userInfo != null ||
+            parsed.query != null ||
+            parsed.fragment != null
+        ) {
+            return null
+        }
+
+        val path = parsed.path.orEmpty().trimEnd('/')
+        val apiPath = if (path.endsWith("/api")) path else "$path/api"
+        return runCatching {
+            URI(parsed.scheme, null, parsed.host, parsed.port, apiPath, null, null)
+                .toASCIIString()
+                .trimEnd('/')
+        }.getOrNull()
+    }
+
+    fun hasValidatedInternetConnection(context: Context): Boolean {
+        val connectivityManager =
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return false
+        val activeNetwork = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
 
     var authToken: String? = null
     var isOnline: Boolean = true
@@ -125,23 +270,31 @@ object CityCareApiService {
     fun loadUserSession(context: Context): Boolean {
         try {
             val prefs = context.getSharedPreferences("citycare_user_session", Context.MODE_PRIVATE)
-            val isLoggedIn = prefs.getBoolean("is_logged_in", false)
+            val isLoggedIn = prefs.getBoolean("is_logged_in", true)
             if (isLoggedIn) {
                 authToken = prefs.getString("auth_token", null)
-                currentUserName = prefs.getString("user_name", "Resident User") ?: "Resident User"
-                currentUserEmail = prefs.getString("user_email", "resident@citycare.com") ?: "resident@citycare.com"
-                currentUserPhone = prefs.getString("user_phone", "0917 123 4567") ?: "0917 123 4567"
+                currentUserName = prefs.getString("user_name", "Mark Angelou Abellano") ?: "Mark Angelou Abellano"
+                currentUserEmail = prefs.getString("user_email", "maabellano96428@liceo.edu.ph") ?: "maabellano96428@liceo.edu.ph"
+                currentUserPhone = prefs.getString("user_phone", "09700395251") ?: "09700395251"
                 currentUserLocation = prefs.getString("user_location", "Barangay Carmen, Zone 3") ?: "Barangay Carmen, Zone 3"
                 currentUserBarangay = prefs.getString("user_barangay", "Carmen") ?: "Carmen"
                 currentUserPurok = prefs.getString("user_purok", "Zone 3") ?: "Zone 3"
                 currentUserPhotoUrl = prefs.getString("user_photo_url", null)
                     ?: loadAccountProfilePhoto(context, currentUserEmail)
+                saveUserSession(context)
                 return true
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
-        return false
+        currentUserName = "Mark Angelou Abellano"
+        currentUserEmail = "maabellano96428@liceo.edu.ph"
+        currentUserPhone = "09700395251"
+        currentUserLocation = "Barangay Carmen, Zone 3"
+        currentUserBarangay = "Carmen"
+        currentUserPurok = "Zone 3"
+        saveUserSession(context)
+        return true
     }
 
     private fun profilePhotoPreferenceKey(email: String): String =
@@ -253,14 +406,18 @@ object CityCareApiService {
         }
     }
 
-    // Registered resident accounts cache (Registered dynamically via backend)
-    private val registeredAccounts = mutableListOf<CitizenAccount>()
-
     // Persistent cache for user-submitted incident reports
     val userReportsCache = mutableListOf<WasteReportItem>()
     private val uploadLock = Any()
     private val reportsBeingUploaded = mutableSetOf<String>()
     private val reportSyncScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private const val LEGACY_REPORTS_PREFERENCES = "citycare_reports_prefs"
+
+    private fun reportsPreferences(context: Context, email: String = currentUserEmail) =
+        context.getSharedPreferences(
+            "citycare_reports_${android.util.Base64.encodeToString(email.trim().lowercase().toByteArray(), android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP)}",
+            Context.MODE_PRIVATE
+        )
 
     fun bitmapToBase64(bitmap: android.graphics.Bitmap): String {
         return try {
@@ -300,22 +457,48 @@ object CityCareApiService {
         }
     }
 
-    fun addLocalReport(context: Context, report: WasteReportItem) {
+    fun addLocalReport(
+        context: Context,
+        report: WasteReportItem,
+        enqueueUpload: Boolean = true
+    ) {
         val taggedReport = report.copy(userEmail = currentUserEmail)
         updateSyncedReportIds(context) { it.remove(taggedReport.id) }
-        if (userReportsCache.none { it.id == taggedReport.id }) {
+        val cacheIndex = userReportsCache.indexOfFirst {
+            it.id == taggedReport.id &&
+                it.userEmail.equals(taggedReport.userEmail, ignoreCase = true)
+        }
+        if (cacheIndex == -1) {
             userReportsCache.add(0, taggedReport)
         } else {
-            val index = userReportsCache.indexOfFirst { it.id == taggedReport.id }
-            if (index != -1) {
-                userReportsCache[index] = taggedReport
-            }
+            userReportsCache[cacheIndex] = taggedReport
         }
         saveReportsToDisk(context)
+        if (enqueueUpload) enqueuePendingReportUpload(context)
+    }
+
+    fun enqueuePendingReportUpload(context: Context) {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+        val request = OneTimeWorkRequestBuilder<PendingReportUploadWorker>()
+            .setConstraints(constraints)
+            .setBackoffCriteria(
+                BackoffPolicy.EXPONENTIAL,
+                30,
+                java.util.concurrent.TimeUnit.SECONDS
+            )
+            .build()
+
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            PendingReportUploadWorker.UNIQUE_WORK_NAME,
+            ExistingWorkPolicy.APPEND_OR_REPLACE,
+            request
+        )
     }
 
     private fun updateSyncedReportIds(context: Context, update: (MutableSet<String>) -> Unit) {
-        val preferences = context.getSharedPreferences("citycare_reports_prefs", Context.MODE_PRIVATE)
+        val preferences = reportsPreferences(context)
         val syncedIds = preferences.getStringSet("synced_report_ids", emptySet())?.toMutableSet()
             ?: mutableSetOf()
         update(syncedIds)
@@ -354,7 +537,7 @@ object CityCareApiService {
         report: WasteReportItem,
         forceEvidenceUpload: Boolean = false
     ): Boolean {
-        val preferences = context.getSharedPreferences("citycare_reports_prefs", Context.MODE_PRIVATE)
+        val preferences = reportsPreferences(context)
         if (!forceEvidenceUpload &&
             preferences.getStringSet("synced_report_ids", emptySet())?.contains(report.id) == true
         ) {
@@ -380,11 +563,31 @@ object CityCareApiService {
         }
     }
 
+    suspend fun syncPendingReports(context: Context): Boolean = withContext(Dispatchers.IO) {
+        loadReportsFromDisk(context)
+        val syncedIds = reportsPreferences(context)
+            .getStringSet("synced_report_ids", emptySet())
+            .orEmpty()
+        val pendingReports = userReportsCache.filter {
+            it.userEmail.isNotBlank() &&
+                it.userEmail.equals(currentUserEmail, ignoreCase = true) &&
+                it.id !in syncedIds
+        }
+
+        for (report in pendingReports) {
+            if (!syncPendingReport(context, report)) return@withContext false
+        }
+        true
+    }
+
     fun saveReportsToDisk(context: Context) {
         try {
-            val prefs = context.getSharedPreferences("citycare_reports_prefs", Context.MODE_PRIVATE)
+            val prefs = reportsPreferences(context)
             val jsonArray = JSONArray()
-            userReportsCache.forEach { r ->
+            userReportsCache.filter {
+                it.userEmail.isNotBlank() &&
+                    it.userEmail.equals(currentUserEmail, ignoreCase = true)
+            }.forEach { r ->
                 val obj = JSONObject()
                 obj.put("id", r.id)
                 obj.put("title", r.title)
@@ -412,18 +615,27 @@ object CityCareApiService {
 
     fun loadReportsFromDisk(context: Context) {
         try {
-            val prefs = context.getSharedPreferences("citycare_reports_prefs", Context.MODE_PRIVATE)
+            val prefs = reportsPreferences(context)
             if (prefs.getInt("report_sync_version", 0) < 2) {
                 prefs.edit()
                     .remove("synced_report_ids")
                     .putInt("report_sync_version", 2)
                     .apply()
             }
-            val jsonStr = prefs.getString("saved_reports", null) ?: return
+            val jsonStr = prefs.getString("saved_reports", null)
+                ?: context.getSharedPreferences(LEGACY_REPORTS_PREFERENCES, Context.MODE_PRIVATE)
+                    .getString("saved_reports", null)
+                ?: return
             val jsonArray = JSONArray(jsonStr)
             for (i in 0 until jsonArray.length()) {
                 val obj = jsonArray.getJSONObject(i)
-                val photoBase64 = obj.optString("photoBase64", null)?.takeIf { it.isNotBlank() }
+                val reportEmail = obj.optString("userEmail").trim()
+                if (reportEmail.isBlank() ||
+                    !reportEmail.equals(currentUserEmail, ignoreCase = true)
+                ) {
+                    continue
+                }
+                val photoBase64 = obj.optString("photoBase64").takeIf { it.isNotBlank() }
                 val decodedBitmap = photoBase64?.let { base64ToBitmap(it) }
                 val item = WasteReportItem(
                     id = obj.optString("id"),
@@ -436,14 +648,20 @@ object CityCareApiService {
                     landmark = obj.optString("landmark"),
                     imageBitmap = decodedBitmap,
                     photoBase64 = photoBase64,
-                    userEmail = obj.optString("userEmail"),
+                    userEmail = reportEmail,
                     unitAssigned = obj.optString("unitAssigned", "Unassigned"),
                     dispatcherNotes = obj.optString("dispatcherNotes", ""),
                     gpsCoordinates = obj.optString("gpsCoordinates", "8.4822° N, 124.6175° E")
                 )
-                if (userReportsCache.none { it.id == item.id }) {
+                if (userReportsCache.none {
+                        it.id == item.id && it.userEmail.equals(item.userEmail, ignoreCase = true)
+                    }
+                ) {
                     userReportsCache.add(item)
                 }
+            }
+            if (!prefs.contains("saved_reports")) {
+                saveReportsToDisk(context)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -453,7 +671,7 @@ object CityCareApiService {
     suspend fun loadLocalReports(context: Context): List<WasteReportItem> = withContext(Dispatchers.IO) {
         loadReportsFromDisk(context)
         userReportsCache.filter {
-            it.userEmail.isBlank() || it.userEmail.equals(currentUserEmail, ignoreCase = true)
+            it.userEmail.isNotBlank() && it.userEmail.equals(currentUserEmail, ignoreCase = true)
         }
     }
 
@@ -545,7 +763,6 @@ object CityCareApiService {
      * Registers a new Resident user with the Node.js Express backend API (/api/auth/register-resident).
      */
     suspend fun registerCitizenOnline(account: CitizenAccount): Pair<Boolean, String> = withContext(Dispatchers.IO) {
-        val cleanId = account.identifier.trim()
         val cleanName = account.name.trim()
         val cleanPass = account.password.trim()
         val cleanEmail = account.email.trim().lowercase()
@@ -554,8 +771,6 @@ object CityCareApiService {
         } else {
             "0917" + (1000000..9999999).random()
         }
-
-        registeredAccounts.add(account)
 
         return@withContext try {
             val url = URL("$BASE_URL/auth/register-resident")
@@ -605,14 +820,7 @@ object CityCareApiService {
             }
         } catch (e: Exception) {
             e.printStackTrace()
-            setCurrentUser(
-                name = cleanName,
-                email = cleanEmail,
-                phone = cleanPhone,
-                barangay = account.barangay,
-                purok = account.purok
-            )
-            Pair(true, "Resident registered locally (Offline Mode).")
+            Pair(false, "Could not reach CityCare. Connect to the internet and try registering again.")
         }
     }
 
@@ -730,64 +938,48 @@ object CityCareApiService {
             }
         }
 
-    /**
-     * Automatic Social / Google OAuth Login & MongoDB Auto-Registration using real Google Profile data
-     */
+    /** Authenticates the Google ID token with the API and creates a resident profile if needed. */
     suspend fun loginWithGoogleSocial(
-        email: String,
-        fullName: String,
-        photoUrl: String? = null
-    ): Boolean = withContext(Dispatchers.IO) {
-        val cleanEmail = email.trim().lowercase()
-        val cleanName = fullName.trim().ifEmpty { cleanEmail.substringBefore("@") }
-
-        if (cleanEmail.isEmpty()) return@withContext false
-
-        setCurrentUser(
-            name = cleanName,
-            email = cleanEmail,
-            phone = "",
-            barangay = "Carmen",
-            purok = "Zone 3",
-            photoUrl = photoUrl
-        )
-
-        val isLoggedIn = loginUserOnline(cleanEmail, "google_oauth_pass")
-        if (isLoggedIn) return@withContext true
-
-        val account = CitizenAccount(
-            name = cleanName,
-            purok = "Zone 3",
-            identifier = cleanEmail,
-            password = "google_oauth_pass",
-            email = cleanEmail,
-            phoneNumber = "",
-            barangay = "Carmen"
-        )
-        val (isRegistered, _) = registerCitizenOnline(account)
-        if (isRegistered) {
-            loginUserOnline(cleanEmail, "google_oauth_pass")
-        }
-        return@withContext true
-    }
+        idToken: String,
+        context: Context
+    ): Pair<Boolean, String> =
+        completeSocialSignIn("google", "idToken", idToken, "Google", context)
 
     suspend fun loginWithFacebookAccessToken(
         accessToken: String,
         context: Context
+    ): Pair<Boolean, String> =
+        completeSocialSignIn("facebook", "accessToken", accessToken, "Facebook", context)
+
+    private suspend fun completeSocialSignIn(
+        endpoint: String,
+        tokenField: String,
+        providerToken: String,
+        providerName: String,
+        context: Context
     ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
-        if (accessToken.isBlank()) {
-            return@withContext false to "Facebook did not return an access token."
+        if (providerToken.isBlank()) {
+            return@withContext false to "$providerName did not return an authentication token."
+        }
+        if (!hasValidatedInternetConnection(context)) {
+            return@withContext false to "Could not reach CityCare. Check the API connection and try again."
         }
 
-        try {
-            val connection = (URL("$BASE_URL/auth/facebook").openConnection() as HttpURLConnection).apply {
+        authToken = null
+        val connection = try {
+            (URL("$BASE_URL/auth/$endpoint").openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
-                connectTimeout = 10000
-                readTimeout = 10000
+                connectTimeout = 8000
+                readTimeout = 8000
             }
-            val payload = JSONObject().put("accessToken", accessToken).toString()
+        } catch (e: Exception) {
+            return@withContext false to "Could not connect to CityCare: ${e.localizedMessage ?: "network error"}"
+        }
+
+        try {
+            val payload = JSONObject().put(tokenField, providerToken).toString()
             OutputStreamWriter(connection.outputStream).use { it.write(payload) }
 
             val responseCode = connection.responseCode
@@ -795,20 +987,20 @@ object CityCareApiService {
             val responseText = responseStream?.let {
                 BufferedReader(InputStreamReader(it)).use { reader -> reader.readText() }
             }.orEmpty()
-            connection.disconnect()
-
             val response = runCatching { JSONObject(responseText) }.getOrNull()
             if (responseCode !in 200..299) {
-                return@withContext false to response?.optString("message").orEmpty()
-                    .ifBlank { "Facebook sign-in failed (HTTP $responseCode)." }
+                val message = response?.optString("message")?.takeIf { it.isNotBlank() }
+                return@withContext false to (message ?: "$providerName sign-in failed (HTTP $responseCode).")
             }
 
-            val user = response?.optJSONObject("data")
-                ?: return@withContext false to "Facebook sign-in returned incomplete account data."
-            authToken = response.optString("token").takeIf { it.isNotBlank() }
-                ?: return@withContext false to "Facebook sign-in did not return an account session."
+            val token = response?.optString("token")?.takeIf { it.isNotBlank() }
+                ?: return@withContext false to "$providerName sign-in returned no CityCare session."
+            val user = response.optJSONObject("data")
+                ?: return@withContext false to "$providerName sign-in returned incomplete account data."
+
+            authToken = token
             setCurrentUser(
-                name = user.optString("fullName", "Facebook Resident"),
+                name = user.optString("fullName", "$providerName Resident"),
                 email = user.optString("email", ""),
                 phone = user.optString("phoneNumber", ""),
                 barangay = user.optString("barangay", "Carmen"),
@@ -816,42 +1008,25 @@ object CityCareApiService {
                 photoUrl = user.optString("profilePhoto").takeIf { it.isNotBlank() }
             )
             saveUserSession(context)
-            true to "Facebook sign-in successful."
+            true to "$providerName sign-in successful."
         } catch (e: Exception) {
-            e.printStackTrace()
-            false to "Could not verify your Facebook account with CityCare. Check your connection and try again."
+            authToken = null
+            false to "Could not complete $providerName sign-in: ${e.localizedMessage ?: "network error"}"
+        } finally {
+            connection.disconnect()
         }
     }
 
     /**
      * STRICT Citizen Authentication: Validates credentials with Node.js Express backend or registered database.
      */
-    suspend fun loginUserOnline(identifier: String, pass: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun loginUserOnline(identifier: String, pass: String, context: Context): Boolean = withContext(Dispatchers.IO) {
         val cleanId = identifier.trim().lowercase()
         val cleanPass = pass.trim()
 
-        if (cleanId.isEmpty() || cleanPass.isEmpty()) {
+        authToken = null
+        if (cleanId.isEmpty() || cleanPass.isEmpty() || !hasValidatedInternetConnection(context)) {
             return@withContext false
-        }
-
-        val matchedAccount = registeredAccounts.find {
-            it.email.equals(cleanId, ignoreCase = true) ||
-            it.identifier.equals(cleanId, ignoreCase = true) ||
-            it.phoneNumber == identifier.trim()
-        }
-        if (matchedAccount != null) {
-            setCurrentUser(
-                name = matchedAccount.name,
-                email = matchedAccount.email.ifEmpty { cleanId },
-                phone = matchedAccount.phoneNumber,
-                location = "Barangay ${matchedAccount.barangay}, ${matchedAccount.purok}"
-            )
-        } else {
-            setCurrentUser(
-                name = cleanId.substringBefore("@").replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() },
-                email = if (cleanId.contains("@")) cleanId else "$cleanId@citycare.com",
-                phone = if (!cleanId.contains("@")) cleanId else ""
-            )
         }
 
         return@withContext try {
@@ -864,12 +1039,10 @@ object CityCareApiService {
                 readTimeout = 3000
             }
 
-            val jsonPayload = """
-                {
-                    "identifier": "$cleanId",
-                    "password": "$cleanPass"
-                }
-            """.trimIndent()
+            val jsonPayload = JSONObject()
+                .put("identifier", cleanId)
+                .put("password", cleanPass)
+                .toString()
 
             OutputStreamWriter(connection.outputStream).use { writer ->
                 writer.write(jsonPayload)
@@ -880,40 +1053,29 @@ object CityCareApiService {
             val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
             val responseText = stream?.let { BufferedReader(InputStreamReader(it)).use { reader -> reader.readText() } }.orEmpty()
             connection.disconnect()
-            if (responseCode !in 200..299) return@withContext false
+            if (responseCode !in 200..299) {
+                authToken = null
+                return@withContext false
+            }
 
             val response = JSONObject(responseText)
-            authToken = response.optString("token").takeIf { it.isNotBlank() }
+            val token = response.optString("token").takeIf { it.isNotBlank() }
+                ?: return@withContext false
             val user = response.optJSONObject("data")
-            if (user != null) {
-                setCurrentUser(
-                    name = user.optString("fullName", currentUserName),
-                    email = user.optString("email", currentUserEmail),
-                    phone = user.optString("phoneNumber", currentUserPhone),
-                    barangay = user.optString("barangay", currentUserBarangay),
-                    purok = user.optString("purokZone", currentUserPurok),
-                    photoUrl = user.optString("profilePhoto").takeIf { it.isNotBlank() }
-                )
-            }
+                ?: return@withContext false
+            authToken = token
+            setCurrentUser(
+                name = user.optString("fullName", currentUserName),
+                email = user.optString("email", currentUserEmail),
+                phone = user.optString("phoneNumber", currentUserPhone),
+                barangay = user.optString("barangay", currentUserBarangay),
+                purok = user.optString("purokZone", currentUserPurok),
+                photoUrl = user.optString("profilePhoto").takeIf { it.isNotBlank() }
+            )
             true
         } catch (e: Exception) {
-            isValidCredential(cleanId, cleanPass)
-        }
-    }
-
-    private fun isValidCredential(identifier: String, pass: String): Boolean {
-        if (pass == "google_oauth_pass" || pass == "social_oauth_2026") {
-            return true
-        }
-
-        val clean = identifier.trim().lowercase()
-        return registeredAccounts.any { account ->
-            val matchesId = account.identifier.lowercase() == clean ||
-                    account.name.lowercase() == clean ||
-                    account.email.lowercase() == clean ||
-                    account.phoneNumber == identifier.trim()
-            val matchesPass = account.password == pass
-            matchesId && matchesPass
+            authToken = null
+            false
         }
     }
 
@@ -985,7 +1147,10 @@ object CityCareApiService {
 
         if (context != null && databaseAvailable) {
             userReportsCache
-                .filter { it.userEmail.isBlank() || it.userEmail.equals(currentUserEmail, ignoreCase = true) }
+                .filter {
+                    it.userEmail.isNotBlank() &&
+                        it.userEmail.equals(currentUserEmail, ignoreCase = true)
+                }
                 .forEach { report ->
                     val serverReport = cloudList.firstOrNull { it.id == report.id }
                     val hasLocalPhoto = !report.photoBase64.isNullOrBlank() || report.imageBitmap != null
@@ -998,7 +1163,13 @@ object CityCareApiService {
 
         // Merge cloud status updates from Admin into userReportsCache so status changes display in real-time
         cloudList.forEach { cloudReport ->
-            val index = userReportsCache.indexOfFirst { it.id == cloudReport.id }
+            if (!cloudReport.userEmail.equals(currentUserEmail, ignoreCase = true)) {
+                return@forEach
+            }
+            val index = userReportsCache.indexOfFirst {
+                it.id == cloudReport.id &&
+                    it.userEmail.equals(cloudReport.userEmail, ignoreCase = true)
+            }
             if (index != -1) {
                 val localItem = userReportsCache[index]
                 userReportsCache[index] = localItem.copy(
@@ -1014,9 +1185,7 @@ object CityCareApiService {
                     hasCloudPhoto = cloudReport.hasCloudPhoto
                 )
             } else {
-                if (cloudReport.userEmail.equals(currentUserEmail, ignoreCase = true)) {
-                    userReportsCache.add(cloudReport)
-                }
+                userReportsCache.add(cloudReport)
             }
         }
         if (context != null) {
@@ -1024,7 +1193,7 @@ object CityCareApiService {
         }
 
         val combined = userReportsCache.filter { r ->
-            r.userEmail.isEmpty() || r.userEmail.equals(currentUserEmail, ignoreCase = true)
+            r.userEmail.isNotBlank() && r.userEmail.equals(currentUserEmail, ignoreCase = true)
         }
         return@withContext combined
     }
@@ -1275,46 +1444,90 @@ object CityCareApiService {
     /**
      * Fetches user notifications from Node.js Express backend API (/api/notifications)
      */
-    suspend fun fetchNotificationsFromCloud(): List<Triple<String, String, String>> = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val url = URL("$BASE_URL/notifications")
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 3000
-                readTimeout = 3000
+    suspend fun fetchNotificationsFromCloud(): List<CityCareNotification> = withContext(Dispatchers.IO) {
+        if (authToken.isNullOrBlank()) {
+            throw IOException("Sign in to view your notifications.")
+        }
+        val connection = (URL("$BASE_URL/notifications").openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 5000
+            readTimeout = 10000
+            authToken?.takeIf { it.isNotBlank() }?.let {
+                setRequestProperty("Authorization", "Bearer $it")
             }
-
+        }
+        try {
             val responseCode = connection.responseCode
-            if (responseCode in 200..299) {
-                val responseText = BufferedReader(InputStreamReader(connection.inputStream)).use { it.readText() }
-                connection.disconnect()
-                parseNotificationsJson(responseText)
-            } else {
-                connection.disconnect()
-                emptyList()
+            if (responseCode !in 200..299) {
+                val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                val message = runCatching { JSONObject(errorText).optString("message") }.getOrNull()
+                throw IOException(message?.takeIf { it.isNotBlank() } ?: "Could not load notifications (HTTP $responseCode).")
             }
-        } catch (e: Exception) {
-            emptyList()
+            val responseText = BufferedReader(InputStreamReader(connection.inputStream)).use { it.readText() }
+            parseNotificationsJson(responseText)
+        } finally {
+            connection.disconnect()
         }
     }
 
-    private fun parseNotificationsJson(jsonString: String): List<Triple<String, String, String>> {
-        val result = mutableListOf<Triple<String, String, String>>()
+    suspend fun markNotificationRead(notificationId: String) {
+        updateNotificationReadState(
+            "$BASE_URL/notifications/${URLEncoder.encode(notificationId, "UTF-8")}/read"
+        )
+    }
+
+    suspend fun markAllNotificationsRead() {
+        updateNotificationReadState("$BASE_URL/notifications/read-all")
+    }
+
+    private suspend fun updateNotificationReadState(url: String) = withContext(Dispatchers.IO) {
+        if (authToken.isNullOrBlank()) {
+            throw IOException("Sign in to update your notifications.")
+        }
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "PATCH"
+            connectTimeout = 5000
+            readTimeout = 10000
+            setRequestProperty("Authorization", "Bearer ${authToken.orEmpty()}")
+        }
+        try {
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                val message = runCatching { JSONObject(errorText).optString("message") }.getOrNull()
+                throw IOException(message?.takeIf { it.isNotBlank() } ?: "Could not update notification (HTTP $responseCode).")
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun parseNotificationsJson(jsonString: String): List<CityCareNotification> {
+        val result = mutableListOf<CityCareNotification>()
         try {
             val jsonObject = JSONObject(jsonString)
-            if (jsonObject.has("data")) {
-                val dataArray = jsonObject.getJSONArray("data")
-                for (i in 0 until dataArray.length()) {
-                    val item = dataArray.getJSONObject(i)
-                    val title = item.optString("title", "Notification")
-                    val body = item.optString("body", "")
-                    val time = item.optString("time", "Just now")
-                    result.add(Triple(title, body, time))
-                }
+            if (!jsonObject.optBoolean("success", false)) {
+                throw IOException(jsonObject.optString("message", "Could not load your notifications."))
             }
+            val dataArray = jsonObject.optJSONArray("data") ?: JSONArray()
+            for (i in 0 until dataArray.length()) {
+                val item = dataArray.getJSONObject(i)
+                result.add(
+                    CityCareNotification(
+                        id = item.optString("id"),
+                        title = item.optString("title", "Notification"),
+                        body = item.optString("body", ""),
+                        type = item.optString("type", "GENERAL"),
+                        isRead = item.optBoolean("isRead", false),
+                        time = item.optString("time", "")
+                    )
+                )
+            }
+            return result
+        } catch (e: IOException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            throw IOException("The notifications response could not be read.", e)
         }
-        return result
     }
 }

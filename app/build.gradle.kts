@@ -12,10 +12,16 @@ android {
         applicationId = "com.example.razoproject"
         minSdk = 24
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.2.2"
+        versionCode = 8
+        versionName = "1.2.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        val defaultCityCareApiUrl = "http://10.0.2.2:5001/api"
+        val cityCareApiUrl = providers.gradleProperty("CITYCARE_API_URL")
+            .orElse(defaultCityCareApiUrl)
+            .get()
+        buildConfigField("String", "CITYCARE_API_URL", "\"$cityCareApiUrl\"")
 
         val facebookAppId = providers.gradleProperty("FACEBOOK_APP_ID").orElse("").get()
         resValue("string", "facebook_app_id", facebookAppId)
@@ -47,6 +53,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.11"
@@ -70,6 +77,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
     implementation(libs.androidx.ui.graphics)

@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { connection } = require('../config/reportDb');
 
 const reportSchema = new mongoose.Schema({
   reportId: {
@@ -52,7 +53,8 @@ const reportSchema = new mongoose.Schema({
   },
   photoUrl: {
     type: String,
-    default: ''
+    default: '',
+    maxlength: 5600040
   },
   userEmail: {
     type: String,
@@ -68,4 +70,4 @@ const reportSchema = new mongoose.Schema({
   timestamps: true
 });
 
-module.exports = mongoose.model('Report', reportSchema);
+module.exports = connection.model('Report', reportSchema);

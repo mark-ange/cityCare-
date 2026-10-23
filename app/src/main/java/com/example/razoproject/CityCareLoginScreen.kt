@@ -71,7 +71,7 @@ fun FacebookLogoIcon(modifier: Modifier = Modifier.size(20.dp)) {
         Text(
             text = "f",
             color = Color.White,
-            fontSize = 15.sp,
+            fontSize = 20.sp,
             fontWeight = FontWeight.ExtraBold,
             modifier = Modifier.offset(x = 1.dp, y = (-1).dp)
         )
@@ -153,7 +153,9 @@ fun CityCareLoginScreen(
     var regBarangay by remember { mutableStateOf("Iponan") }
     var regPurokZone by remember { mutableStateOf("") }
     var regPassword by remember { mutableStateOf("") }
+    var isRegPasswordVisible by remember { mutableStateOf(false) }
     var regConfirmPassword by remember { mutableStateOf("") }
+    var isRegConfirmPasswordVisible by remember { mutableStateOf(false) }
     var regAgreeTerms by remember { mutableStateOf(false) }
     var isRegistering by remember { mutableStateOf(false) }
     var isBarangayDropdownExpanded by remember { mutableStateOf(false) }
@@ -161,6 +163,11 @@ fun CityCareLoginScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var successMessage by remember { mutableStateOf<String?>(null) }
     var isAuthenticatingSocial by remember { mutableStateOf(false) }
+    var showApiSettings by remember { mutableStateOf(false) }
+    var apiUrl by remember { mutableStateOf(CityCareApiService.BASE_URL) }
+    var isCheckingApi by remember { mutableStateOf(false) }
+    var apiConnectionMessage by remember { mutableStateOf<String?>(null) }
+    var apiConnectionSucceeded by remember { mutableStateOf<Boolean?>(null) }
 
     val coroutineScope = rememberCoroutineScope()
     val barangayList = listOf("Iponan", "Bulua", "Canitoan", "Carmen", "Patag", "Kauswagan")
@@ -182,19 +189,24 @@ fun CityCareLoginScreen(
         val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
         try {
             val account = task.getResult(ApiException::class.java)
-            val realEmail = account?.email ?: ""
-            val displayName = account?.displayName ?: account?.givenName ?: realEmail.substringBefore("@")
-            val photoUrl = account?.photoUrl?.toString()
-
-            errorMessage = null
-            isAuthenticatingSocial = true
-            coroutineScope.launch {
-                val success = CityCareApiService.loginWithGoogleSocial(realEmail, displayName, photoUrl)
+            val idToken = account?.idToken
+            if (idToken.isNullOrBlank()) {
                 isAuthenticatingSocial = false
-                if (success) {
-                    onLoginSuccess()
-                } else {
-                    errorMessage = "Unable to authenticate Google account ($realEmail)."
+                errorMessage = "Google did not return an ID token. Check the Web OAuth client ID configuration."
+            } else {
+                errorMessage = null
+                isAuthenticatingSocial = true
+                coroutineScope.launch {
+                    val (success, message) = CityCareApiService.loginWithGoogleSocial(
+                        idToken = idToken,
+                        context = context
+                    )
+                    isAuthenticatingSocial = false
+                    if (success) {
+                        onLoginSuccess()
+                    } else {
+                        errorMessage = message
+                    }
                 }
             }
         } catch (e: ApiException) {
@@ -266,7 +278,7 @@ fun CityCareLoginScreen(
     }
 
     Scaffold(
-        containerColor = Color(0xFFF8FAFC),
+        containerColor = MaterialTheme.colorScheme.background,
         contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { paddingValues ->
         LazyColumn(
@@ -429,6 +441,18 @@ fun CityCareLoginScreen(
                         Spacer(modifier = Modifier.height(14.dp))
                     }
 
+                    TextButton(
+                        onClick = {
+                            apiUrl = CityCareApiService.BASE_URL
+                            apiConnectionMessage = null
+                            apiConnectionSucceeded = null
+                            showApiSettings = true
+                        },
+                        modifier = Modifier.align(Alignment.End)
+                    ) {
+                        Text("Server settings", color = EcoAuthGreen, fontSize = 12.sp)
+                    }
+
                     successMessage?.let { msg ->
                         Surface(
                             color = Color(0xFFECFDF5),
@@ -543,18 +567,23 @@ fun CityCareLoginScreen(
                                         errorMessage = "Please enter your Email address or Resident ID!"
                                     } else if (cleanPass.isEmpty()) {
                                         errorMessage = "Please enter your Password!"
+                                    } else if (!CityCareApiService.hasValidatedInternetConnection(context)) {
+                                        errorMessage = "An internet connection is required to sign in. Connect and try again."
                                     } else {
                                         errorMessage = null
                                         isAuthenticatingSocial = true
                                         coroutineScope.launch {
-                                            val isValid = CityCareApiService.loginUserOnline(cleanEmail, cleanPass)
+                                            val isValid = CityCareApiService.loginUserOnline(cleanEmail, cleanPass, context)
                                             isAuthenticatingSocial = false
                                             if (isValid) {
                                                 onLoginSuccess()
+                                            } else if (!CityCareApiService.hasValidatedInternetConnection(context)) {
+                                                errorMessage = "An internet connection is required to sign in. Connect and try again."
                                             } else {
                                                 errorMessage = "Login Failed: Invalid Email/Resident ID or Password. Please check your credentials or register a new account."
                                             }
                                         }
+
                                     }
                                 },
                                 enabled = !isAuthenticatingSocial,
@@ -597,61 +626,75 @@ fun CityCareLoginScreen(
                             // UPDATED SOCIAL LOGIN BUTTONS WITH REAL GOOGLE OAUTH
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.Center,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                                    OutlinedButton(
-                                        onClick = {
-                                            errorMessage = null
-                                            if (facebookLauncher == null) {
-                                                errorMessage = "Facebook sign-in is not configured. Add the Facebook App ID and Client Token to your Gradle properties, then rebuild."
-                                            } else if (!isAuthenticatingSocial) {
-                                                isAuthenticatingSocial = true
-                                                facebookLauncher.launch(listOf("email", "public_profile"))
-                                            }
-                                        },
-                                        enabled = !isAuthenticatingSocial,
-                                        modifier = Modifier.height(44.dp),
-                                        shape = RoundedCornerShape(10.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFCBD5E1))
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            FacebookLogoIcon(modifier = Modifier.size(20.dp))
-                                            Text("Facebook", fontSize = 12.sp, color = EcoAuthTextDark, fontWeight = FontWeight.Bold)
-                                        }
-                                    }
-
-                                    // Real Google Sign-In Button (Always prompts Account Picker)
-                                    OutlinedButton(
-                                        onClick = {
-                                            if (isAuthenticatingSocial) return@OutlinedButton
-                                            errorMessage = null
+                                OutlinedButton(
+                                    onClick = {
+                                        errorMessage = null
+                                        if (facebookLauncher == null) {
+                                            errorMessage = "Facebook sign-in is not configured. Add the Facebook App ID and Client Token to your Gradle properties, then rebuild."
+                                        } else if (!CityCareApiService.hasValidatedInternetConnection(context)) {
+                                            errorMessage = "An internet connection is required to sign in. Connect and try again."
+                                        } else if (!isAuthenticatingSocial) {
                                             isAuthenticatingSocial = true
-                                            googleSignInClient.signOut().addOnCompleteListener {
-                                                googleLauncher.launch(googleSignInClient.signInIntent)
-                                            }
-                                        },
-                                        modifier = Modifier.height(44.dp),
-                                        enabled = !isAuthenticatingSocial,
-                                        shape = RoundedCornerShape(10.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFCBD5E1))
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            GoogleLogoIcon(modifier = Modifier.size(20.dp))
-                                            Text(
-                                                if (isAuthenticatingSocial) "Signing in..." else "Google",
-                                                fontSize = 12.sp,
-                                                color = EcoAuthTextDark,
-                                                fontWeight = FontWeight.Bold
-                                            )
+                                            facebookLauncher.launch(listOf("email", "public_profile"))
                                         }
+                                    },
+                                    enabled = !isAuthenticatingSocial,
+                                    modifier = Modifier.weight(1f).height(52.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFCBD5E1)),
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                                    ) {
+                                        FacebookLogoIcon(modifier = Modifier.size(28.dp))
+                                        Text(
+                                            "Facebook",
+                                            fontSize = 13.sp,
+                                            color = EcoAuthTextDark,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            softWrap = false
+                                        )
+                                    }
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        if (isAuthenticatingSocial) return@OutlinedButton
+                                        errorMessage = null
+                                        if (!CityCareApiService.hasValidatedInternetConnection(context)) {
+                                            errorMessage = "An internet connection is required to sign in. Connect and try again."
+                                            return@OutlinedButton
+                                        }
+                                        isAuthenticatingSocial = true
+                                        googleSignInClient.signOut().addOnCompleteListener {
+                                            googleLauncher.launch(googleSignInClient.signInIntent)
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1f).height(52.dp),
+                                    enabled = !isAuthenticatingSocial,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFCBD5E1)),
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                                    ) {
+                                        GoogleLogoIcon(modifier = Modifier.size(28.dp))
+                                        Text(
+                                            if (isAuthenticatingSocial) "Signing in..." else "Google",
+                                            fontSize = 13.sp,
+                                            color = EcoAuthTextDark,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            softWrap = false
+                                        )
                                     }
                                 }
                             }
@@ -801,8 +844,17 @@ fun CityCareLoginScreen(
                                         placeholder = { Text("e.g. Mark1234!", fontSize = 12.sp, color = EcoAuthTextMuted) },
                                         modifier = Modifier.fillMaxWidth(),
                                         singleLine = true,
-                                        visualTransformation = PasswordVisualTransformation(),
-                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+                                        visualTransformation = if (isRegPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                                        trailingIcon = {
+                                            IconButton(onClick = { isRegPasswordVisible = !isRegPasswordVisible }) {
+                                                Icon(
+                                                    imageVector = if (isRegPasswordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                                    contentDescription = if (isRegPasswordVisible) "Hide password" else "Show password",
+                                                    tint = EcoAuthTextMuted
+                                                )
+                                            }
+                                        },
+                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Next),
                                         shape = RoundedCornerShape(8.dp),
                                         colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = EcoAuthGreen, unfocusedBorderColor = Color(0xFFCBD5E1))
                                     )
@@ -819,7 +871,16 @@ fun CityCareLoginScreen(
                                         placeholder = { Text("e.g. Mark1234!", fontSize = 12.sp, color = EcoAuthTextMuted) },
                                         modifier = Modifier.fillMaxWidth(),
                                         singleLine = true,
-                                        visualTransformation = PasswordVisualTransformation(),
+                                        visualTransformation = if (isRegConfirmPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                                        trailingIcon = {
+                                            IconButton(onClick = { isRegConfirmPasswordVisible = !isRegConfirmPasswordVisible }) {
+                                                Icon(
+                                                    imageVector = if (isRegConfirmPasswordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                                    contentDescription = if (isRegConfirmPasswordVisible) "Hide password" else "Show password",
+                                                    tint = EcoAuthTextMuted
+                                                )
+                                            }
+                                        },
                                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
                                         shape = RoundedCornerShape(8.dp),
                                         colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = EcoAuthGreen, unfocusedBorderColor = Color(0xFFCBD5E1))
@@ -918,6 +979,69 @@ fun CityCareLoginScreen(
                 }
             }
         }
+    }
+
+    if (showApiSettings) {
+        AlertDialog(
+            onDismissRequest = { if (!isCheckingApi) showApiSettings = false },
+            title = { Text("CityCare API address") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Set the backend address used for sign-in and registration. Android emulator: http://10.0.2.2:5001/api. A phone needs your computer's reachable Wi-Fi address or active HTTPS tunnel."
+                    )
+                    OutlinedTextField(
+                        value = apiUrl,
+                        onValueChange = { apiUrl = it },
+                        label = { Text("API URL") },
+                        placeholder = { Text("http://10.0.2.2:5001/api") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    apiConnectionMessage?.let { message ->
+                        Text(
+                            text = message,
+                            color = if (apiConnectionSucceeded == true) EcoAuthGreen else MaterialTheme.colorScheme.error,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !isCheckingApi,
+                    onClick = {
+                        val saved = CityCareApiService.saveApiBaseUrl(context, apiUrl)
+                        if (!saved.first) {
+                            apiConnectionSucceeded = false
+                            apiConnectionMessage = saved.second
+                        } else {
+                            apiUrl = CityCareApiService.BASE_URL
+                            isCheckingApi = true
+                            apiConnectionSucceeded = null
+                            apiConnectionMessage = "Checking API and database..."
+                            coroutineScope.launch {
+                                val result = CityCareApiService.checkApiConnection()
+                                apiConnectionSucceeded = result.first
+                                apiConnectionMessage = result.second
+                                isCheckingApi = false
+                            }
+                        }
+                    }
+                ) {
+                    Text(if (isCheckingApi) "Checking..." else "Save & test")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !isCheckingApi,
+                    onClick = { showApiSettings = false }
+                ) {
+                    Text("Close")
+                }
+            }
+        )
     }
 }
 

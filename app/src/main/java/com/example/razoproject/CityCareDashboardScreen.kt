@@ -1,6 +1,7 @@
 package com.example.razoproject
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.location.Geocoder
@@ -19,6 +20,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,6 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -41,6 +44,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.core.view.WindowCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -64,12 +68,14 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
+import java.util.TimeZone
 
 // Color Palette matching Eco UI Design
 val EcoHeaderDark = Color(0xFF0F382C)
@@ -95,6 +101,31 @@ val DashboardHomeTabYellow = EcoHomeTabYellow
 
 private fun normalizedAreaName(value: String): String =
     value.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9]+"), " ").trim()
+
+private fun reportDateTimestamp(value: String): Long {
+    val formats = listOf(
+        "MMM d, yyyy • h:mm a",
+        "MMM d, yyyy h:mm a",
+        "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+        "yyyy-MM-dd'T'HH:mm:ss'Z'",
+        "yyyy-MM-dd"
+    )
+    return formats.firstNotNullOfOrNull { format ->
+        runCatching {
+            SimpleDateFormat(format, Locale.US).apply { isLenient = false }.parse(value)?.time
+        }.getOrNull()
+    } ?: Long.MIN_VALUE
+}
+
+private fun formatNotificationTimestamp(value: String): String {
+    val parsed = runCatching {
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.parse(value)
+    }.getOrNull() ?: return value
+
+    return SimpleDateFormat("MMM d, yyyy • h:mm a", Locale.US).format(parsed)
+}
 
 private fun findMatchingAreaSchedule(
     schedule: CityCareCollectionSchedule?,
@@ -181,15 +212,27 @@ fun CityCareDashboardScreen(
     val coroutineScope = rememberCoroutineScope()
     var selectedTab by rememberSaveable { mutableIntStateOf(0) } // 0: Home, 1: Reports, 2: More
     var currentSubScreen by rememberSaveable { mutableStateOf(DashboardSubScreen.Main) }
+    var unreadNotificationCount by rememberSaveable { mutableIntStateOf(0) }
     var selectedMoreItem by rememberSaveable { mutableStateOf<String>("") }
     var reportStatusFilter by rememberSaveable { mutableStateOf("ALL") }
     var showExitDialog by remember { mutableStateOf(false) }
     var webViewBackHandler by remember { mutableStateOf<(() -> Boolean)?>(null) }
+    var ticketReturnScreen by rememberSaveable { mutableStateOf(DashboardSubScreen.Main) }
+    var ticketReturnTab by rememberSaveable { mutableIntStateOf(0) }
+
+    fun returnFromTicketDetails() {
+        currentSubScreen = ticketReturnScreen
+        selectedTab = ticketReturnTab
+    }
 
     // Register Back Navigation Handler with parent Activity
     DisposableEffect(currentSubScreen, selectedTab) {
         onRegisterBackHandler {
             when {
+                currentSubScreen == DashboardSubScreen.TicketDetails -> {
+                    returnFromTicketDetails()
+                    true
+                }
                 currentSubScreen != DashboardSubScreen.Main -> {
                     val handledByWebView = webViewBackHandler?.invoke() ?: false
                     if (!handledByWebView) currentSubScreen = DashboardSubScreen.Main
@@ -219,25 +262,16 @@ fun CityCareDashboardScreen(
     // Reports State List - loaded permanently from disk & MongoDB
     val reportList = remember { mutableStateListOf<WasteReportItem>() }
 
-    var selectedReport by remember {
-        mutableStateOf(
-            reportList.firstOrNull() ?: WasteReportItem(
-                id = "#CDO-2026-0412",
-                title = "Brgy. Carmen, Purok 2",
-                barangay = "Carmen",
-                date = SimpleDateFormat("MMM d, yyyy • h:mm a", Locale.US).format(Date()),
-                status = "PENDING",
-                userEmail = CityCareApiService.currentUserEmail
-            )
-        )
-    }
+    var selectedReport by remember { mutableStateOf<WasteReportItem?>(null) }
 
     fun openReportDetails(report: WasteReportItem) {
+        ticketReturnScreen = currentSubScreen
+        ticketReturnTab = selectedTab
         selectedReport = report
         currentSubScreen = DashboardSubScreen.TicketDetails
         coroutineScope.launch {
             val latestReport = CityCareApiService.fetchReportDetails(report.id) ?: return@launch
-            if (selectedReport.id != latestReport.id) return@launch
+            if (selectedReport?.id != latestReport.id) return@launch
             selectedReport = latestReport
             val reportIndex = reportList.indexOfFirst { it.id == latestReport.id }
             if (reportIndex >= 0) {
@@ -253,21 +287,31 @@ fun CityCareDashboardScreen(
         lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
             while (currentCoroutineContext().isActive) {
                 val locallySaved = CityCareApiService.loadLocalReports(context)
-                if (locallySaved.isNotEmpty()) {
-                    reportList.clear()
-                    reportList.addAll(locallySaved)
-                    selectedReport = reportList.firstOrNull { it.id == selectedReport.id }
-                        ?: reportList.first()
-                }
+                reportList.clear()
+                reportList.addAll(locallySaved)
 
                 val loaded = CityCareApiService.fetchReportsFromCloud(context)
-                if (loaded.isNotEmpty()) {
-                    reportList.clear()
-                    reportList.addAll(loaded)
-                    selectedReport = reportList.firstOrNull { it.id == selectedReport.id }
-                        ?: reportList.first()
-                }
+                reportList.clear()
+                reportList.addAll(loaded)
                 delay(15_000)
+            }
+        }
+    }
+
+    LaunchedEffect(lifecycle, CityCareApiService.authToken) {
+        lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+            while (currentCoroutineContext().isActive) {
+                if (!CityCareApiService.authToken.isNullOrBlank()) {
+                    try {
+                        unreadNotificationCount = CityCareApiService.fetchNotificationsFromCloud()
+                            .count { !it.isRead }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        android.util.Log.w("CityCareNotifications", "Could not refresh unread notification count.", error)
+                    }
+                }
+                delay(30_000)
             }
         }
     }
@@ -284,10 +328,11 @@ fun CityCareDashboardScreen(
     }
 
     Scaffold(
-        containerColor = Color(0xFFF8FAFC),
+        containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
             if (currentSubScreen == DashboardSubScreen.Main ||
-                currentSubScreen == DashboardSubScreen.Notifications
+                currentSubScreen == DashboardSubScreen.Notifications ||
+                currentSubScreen == DashboardSubScreen.Profile
             ) {
                 // Elevated Center Floating Camera FAB Bottom Navigation Bar
                 Box(
@@ -343,6 +388,7 @@ fun CityCareDashboardScreen(
                                 inactiveIcon = Icons.Outlined.Notifications,
                                 isSelected = currentSubScreen == DashboardSubScreen.Notifications,
                                 onClick = { currentSubScreen = DashboardSubScreen.Notifications },
+                                showUnreadBadge = unreadNotificationCount > 0,
                                 modifier = Modifier.weight(1f)
                             )
 
@@ -405,15 +451,25 @@ fun CityCareDashboardScreen(
                 }
 
                 DashboardSubScreen.TicketDetails -> {
-                    TicketDetailsScreen(
-                        report = selectedReport,
-                        onBack = { currentSubScreen = DashboardSubScreen.Main }
-                    )
+                    val report = selectedReport
+                    if (report == null) {
+                        Text(
+                            text = "No report selected.",
+                            modifier = Modifier.padding(24.dp),
+                            color = EcoTextMuted
+                        )
+                    } else {
+                        TicketDetailsScreen(
+                            report = report,
+                            onBack = { returnFromTicketDetails() }
+                        )
+                    }
                 }
 
                 DashboardSubScreen.Notifications -> {
                     NotificationsScreen(
-                        onBack = { currentSubScreen = DashboardSubScreen.Main }
+                        onBack = { currentSubScreen = DashboardSubScreen.Main },
+                        onUnreadCountChanged = { unreadNotificationCount = it }
                     )
                 }
 
@@ -448,6 +504,7 @@ fun CityCareDashboardScreen(
 
                 DashboardSubScreen.Support -> {
                     SupportScreenContent(
+                        reports = reportList,
                         onBack = { currentSubScreen = DashboardSubScreen.Main },
                         onOpenNotifications = { currentSubScreen = DashboardSubScreen.Notifications },
                         onSelectReport = { report -> openReportDetails(report) }
@@ -502,6 +559,7 @@ fun CityCareDashboardScreen(
                         1 -> MyReportsScreenContent(
                             reports = reportList,
                             initialStatusFilter = reportStatusFilter,
+                            onStatusFilterChanged = { reportStatusFilter = it },
                             onOpenProfile = { currentSubScreen = DashboardSubScreen.Profile },
                             onSelectReport = { report ->
                                 openReportDetails(report)
@@ -511,6 +569,10 @@ fun CityCareDashboardScreen(
                         2 -> MoreScreenContent(
                             onOpenProfile = { currentSubScreen = DashboardSubScreen.Profile },
                             onOpenSupport = { currentSubScreen = DashboardSubScreen.Support },
+                            onOpenActivityHistory = {
+                                reportStatusFilter = "ALL"
+                                selectedTab = 1
+                            },
                             onOpenItem = { item ->
                                 selectedMoreItem = item
                                 currentSubScreen = DashboardSubScreen.MoreDetails
@@ -620,94 +682,70 @@ fun HomeScreenContent(
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.spacedBy(0.dp)
     ) {
-        // 1. Header Profile & Hero Emerald Section
+        // 1. Header Profile & Location Row (Dark Forest Green background with Leaf overlay)
         item {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(bottomStart = 24.dp, bottomEnd = 24.dp))
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(EcoHeaderDark, EcoHeaderGradientEnd)
-                        )
-                    )
-                    .padding(horizontal = 18.dp, vertical = 20.dp)
+                    .background(Color(0xFF0C382C))
+                    .statusBarsPadding()
+                    .padding(top = 12.dp, bottom = 28.dp, start = 18.dp, end = 18.dp)
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    // Profile Row
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            modifier = Modifier.clickable { onOpenProfile() }
-                        ) {
-                            UserProfileAvatarComposable(
-                                modifier = Modifier.size(44.dp),
-                                onClick = onOpenProfile
-                            )
+                Canvas(modifier = Modifier.matchParentSize()) {
+                    val w = size.width
+                    val h = size.height
+                    val leafColor = Color(0xFF144D3A)
+                    drawCircle(color = leafColor, radius = h * 0.45f, center = Offset(w * 0.88f, h * 0.7f))
+                    drawCircle(color = leafColor, radius = h * 0.35f, center = Offset(w * 0.96f, h * 0.3f))
+                }
 
-                            Column {
-                                Text(
-                                    text = "Hello, ${CityCareApiService.currentUserName.substringBefore(" ")}!",
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
-                                )
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Default.LocationOn,
-                                        contentDescription = null,
-                                        tint = EcoLimeAccent,
-                                        modifier = Modifier.size(12.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = CityCareApiService.currentUserLocation,
-                                        fontSize = 11.sp,
-                                        color = Color(0xFFE2E8F0)
-                                    )
-                                }
-                            }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.clickable { onOpenProfile() }
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(52.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF1E7A38))
+                                .border(2.dp, Color.White, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = CityCareApiService.currentUserName.take(1).uppercase().ifEmpty { "M" },
+                                color = Color.White,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
                         }
 
-                    }
-
-                    // Eco Impact & eWaste Stats Card
-                    Card(
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.12f)),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(14.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Eco Score & Recycling", fontSize = 11.sp, color = Color(0xFFCBD5E1))
-                                Text("12.5 kg Recycled", fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
-                                Text("🌱 +85 Eco Impact Points", fontSize = 10.sp, color = EcoLimeAccent, fontWeight = FontWeight.Bold)
-                            }
-
-                            Surface(
-                                color = EcoLimeAccent,
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
+                        Column {
+                            Text(
+                                text = "Hello, ${CityCareApiService.currentUserName.substringBefore(" ")}!",
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.LocationOn,
+                                    contentDescription = null,
+                                    tint = Color(0xFF22C55E),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = "Active Citizen",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = EcoHeaderDark,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    text = CityCareApiService.currentUserLocation,
+                                    fontSize = 12.sp,
+                                    color = Color(0xFFCBD5E1)
                                 )
                             }
                         }
@@ -716,255 +754,390 @@ fun HomeScreenContent(
             }
         }
 
-        // Padding container for lower items
+        // 2. White Sheet Overlay Container
         item {
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 18.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                    .offset(y = (-16).dp)
+                    .clip(RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
+                    .background(MaterialTheme.colorScheme.background)
+                    .padding(horizontal = 18.dp, vertical = 18.dp)
             ) {
-                // 2. Collection Schedule Banner
-                Card(
-                    shape = RoundedCornerShape(14.dp),
-                    colors = CardDefaults.cardColors(containerColor = EcoBannerBg),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFBFDBFE)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    // HERO ECO SCORE CARD
+                    Card(
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF0C382C)),
+                        border = androidx.compose.foundation.BorderStroke(1.5.dp, Color.White.copy(alpha = 0.8f)),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF16A34A)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            Canvas(modifier = Modifier.matchParentSize()) {
+                                val w = size.width
+                                val h = size.height
+                                val leafColor = Color(0xFF144D3A)
+                                drawCircle(color = leafColor, radius = h * 0.6f, center = Offset(w * 0.9f, h * 0.6f))
+                                drawCircle(color = leafColor, radius = h * 0.4f, center = Offset(w * 0.98f, h * 0.2f))
+                            }
 
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = if (residentAreaSchedule?.isSample == true) {
-                                    "SAMPLE schedule — not official:"
-                                } else {
-                                    "CLENRO Collection Schedule:"
-                                },
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = EcoTextDark
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = when {
-                                    isLoadingResidentSchedule -> "Loading schedule..."
-                                    residentScheduleUnavailable -> "Schedule is currently unavailable."
-                                    residentSchedule == null -> "No schedule published for ${CityCareApiService.currentUserBarangay}."
-                                    CityCareApiService.currentUserPurok.isBlank() &&
-                                        residentAreaSchedule?.appliesToAllAreas != true ->
-                                        "Add your purok, zone, or street in your profile to find its collection route."
-                                    residentAreaSchedule == null ->
-                                        "No area-specific schedule is published for ${CityCareApiService.currentUserPurok}."
-                                    else -> buildString {
-                                        if (residentAreaSchedule?.isSample == true) {
-                                            append("SAMPLE ONLY — not an official CLENRO schedule.\n")
-                                        }
-                                        append("Area: ${residentAreaSchedule?.areaName.orEmpty()}")
-                                        append("\nBiodegradable: ${residentAreaSchedule?.biodegradableDays.orEmpty()}")
-                                        append("\nNon-biodegradable: ${residentAreaSchedule?.nonBiodegradableDays.orEmpty()}")
-                                        append("\nTime: ${residentAreaSchedule?.timeSlot.orEmpty()}")
-                                        append("\nTruck: ${residentAreaSchedule?.assignedTruck.orEmpty()}")
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                // Left Circular Gauge Icon
+                                Box(
+                                    modifier = Modifier.size(72.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Canvas(modifier = Modifier.fillMaxSize()) {
+                                        val stroke = 8.dp.toPx()
+                                        drawArc(
+                                            color = Color(0xFF22C55E),
+                                            startAngle = 130f,
+                                            sweepAngle = 280f,
+                                            useCenter = false,
+                                            style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                                        )
                                     }
-                                },
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = EcoTextMuted,
-                                lineHeight = 15.sp
-                            )
+                                    Icon(
+                                        imageVector = Icons.Default.Autorenew,
+                                        contentDescription = null,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(32.dp)
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.width(12.dp))
+
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "ECO SCORE & RECYCLING",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF80ED99),
+                                        letterSpacing = 0.5.sp
+                                    )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = "12.5 kg",
+                                        fontSize = 22.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = Color.White
+                                    )
+                                    Text(
+                                        text = "Recycled",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = "🌱 +85 Eco Impact Points",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color(0xFF80ED99)
+                                    )
+                                }
+
+                                Surface(
+                                    color = Color(0xFF80ED99),
+                                    shape = RoundedCornerShape(20.dp),
+                                    modifier = Modifier.clickable { }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "🌱 Active Citizen",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF0C382C)
+                                        )
+                                        Spacer(modifier = Modifier.width(2.dp))
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                            contentDescription = null,
+                                            tint = Color(0xFF0C382C),
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
-
-                        Icon(
-                            imageVector = Icons.Outlined.Info,
-                            contentDescription = null,
-                            tint = Color(0xFF93C5FD),
-                            modifier = Modifier.size(32.dp)
-                        )
                     }
-                }
 
-                // 3. Dynamic Quick Status Summary Cards
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
+                    // COLLECTION SCHEDULE BANNER
                     Card(
-                        onClick = { onViewReportsByStatus("PENDING") },
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                        modifier = Modifier.weight(1f)
+                        onClick = { onSelectGridFeature("Schedule") },
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFC8E6C9)),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "$pendingCount",
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                color = Color(0xFFEAB308)
-                            )
-                            Text(
-                                text = "PENDING",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = EcoTextMuted
-                            )
-                        }
-                    }
-
-                    Card(
-                        onClick = { onViewReportsByStatus("ASSIGNED") },
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "$assignedCount",
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                color = Color(0xFF0284C7)
-                            )
-                            Text(
-                                text = "ASSIGNED",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = EcoTextMuted
-                            )
-                        }
-                    }
-
-                    Card(
-                        onClick = { onViewReportsByStatus("DONE") },
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "$doneCount",
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                color = Color(0xFF16A34A)
-                            )
-                            Text(
-                                text = "DONE",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = EcoTextMuted
-                            )
-                        }
-                    }
-                }
-
-                // 4. Quick Services Action Feature Grid
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = "Quick Services",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = EcoTextDark
-                    )
-
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        actionGridList.chunked(3).forEach { rowItems ->
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            rowItems.forEach { item ->
-                                QuickActionCard(
-                                    item = item,
-                                    onClick = { onSelectGridFeature(item.title) },
-                                    modifier = Modifier.weight(1f)
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF16A34A)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Event,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(20.dp)
                                 )
                             }
-                            repeat(3 - rowItems.size) { Spacer(modifier = Modifier.weight(1f)) }
-                        }
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "CLENRO Collection Schedule",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFF1E293B)
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "Schedule is currently unavailable.",
+                                    fontSize = 11.sp,
+                                    color = Color(0xFF64748B)
+                                )
+                            }
+
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Info,
+                                    contentDescription = null,
+                                    tint = Color(0xFF0284C7),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                    contentDescription = null,
+                                    tint = Color(0xFF64748B),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                         }
                     }
-                }
 
-                // 5. Recent Reports Header & Item
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Recent Reports",
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = EcoTextDark
-                    )
-                    Text(
-                        text = "View All",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF16A34A),
-                        modifier = Modifier.clickable { onViewAllReports() }
-                    )
-                }
+                    // QUICK STAT CARDS ROW
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        // Stat Card 1: PENDING
+                        Card(
+                            onClick = { onViewReportsByStatus("PENDING") },
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF1F5F9)),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                Canvas(modifier = Modifier.matchParentSize()) {
+                                    val w = size.width
+                                    val h = size.height
+                                    drawCircle(color = Color(0xFFFEF9C3).copy(alpha = 0.6f), radius = h * 0.6f, center = Offset(w * 0.5f, h * 1.1f))
+                                }
 
-                // Recent Report Card (Loads latest submitted report permanently)
-                val latestReport = reports.firstOrNull() ?: WasteReportItem(
-                    id = "#CDO-2026-0412",
-                    title = "Brgy. Carmen, Purok 2",
-                    barangay = "Carmen",
-                    date = SimpleDateFormat("MMM d, yyyy • h:mm a", Locale.US).format(Date()),
-                    status = "PENDING",
-                    userEmail = CityCareApiService.currentUserEmail
-                )
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(0xFFEAB308)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Outlined.Schedule,
+                                                contentDescription = null,
+                                                tint = Color.White,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                        Column {
+                                            Text(
+                                                text = pendingCount.toString(),
+                                                fontSize = 18.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = Color(0xFFEAB308)
+                                            )
+                                            Text(
+                                                text = "PENDING",
+                                                fontSize = 8.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = Color(0xFF64748B)
+                                            )
+                                        }
+                                    }
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                        contentDescription = null,
+                                        tint = Color(0xFFCBD5E1),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+                        }
 
-                Card(
-                    onClick = { onSelectReport(latestReport) },
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                        // Stat Card 2: ASSIGNED
+                        Card(
+                            onClick = { onViewReportsByStatus("ASSIGNED") },
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF1F5F9)),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                Canvas(modifier = Modifier.matchParentSize()) {
+                                    val w = size.width
+                                    val h = size.height
+                                    drawCircle(color = Color(0xFFE0F2FE).copy(alpha = 0.6f), radius = h * 0.6f, center = Offset(w * 0.5f, h * 1.1f))
+                                }
+
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(0xFF0284C7)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Person,
+                                                contentDescription = null,
+                                                tint = Color.White,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                        Column {
+                                            Text(
+                                                text = assignedCount.toString(),
+                                                fontSize = 18.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = Color(0xFF0284C7)
+                                            )
+                                            Text(
+                                                text = "ASSIGNED",
+                                                fontSize = 8.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = Color(0xFF64748B)
+                                            )
+                                        }
+                                    }
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                        contentDescription = null,
+                                        tint = Color(0xFFCBD5E1),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        // Stat Card 3: DONE
+                        Card(
+                            onClick = { onViewReportsByStatus("DONE") },
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF1F5F9)),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                Canvas(modifier = Modifier.matchParentSize()) {
+                                    val w = size.width
+                                    val h = size.height
+                                    drawCircle(color = Color(0xFFDCFCE7).copy(alpha = 0.6f), radius = h * 0.6f, center = Offset(w * 0.5f, h * 1.1f))
+                                }
+
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(0xFF16A34A)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = null,
+                                                tint = Color.White,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                        Column {
+                                            Text(
+                                                text = doneCount.toString(),
+                                                fontSize = 18.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = Color(0xFF16A34A)
+                                            )
+                                            Text(
+                                                text = "DONE",
+                                                fontSize = 8.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = Color(0xFF64748B)
+                                            )
+                                        }
+                                    }
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                        contentDescription = null,
+                                        tint = Color(0xFFCBD5E1),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // QUICK SERVICES SECTION
                     Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
+                        modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Row(
@@ -972,37 +1145,173 @@ fun HomeScreenContent(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            StatusBadgeChip(status = latestReport.status)
-
                             Text(
-                                text = latestReport.date,
-                                fontSize = 11.sp,
-                                color = EcoTextMuted
+                                text = "Quick Services",
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF1E293B)
                             )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.clickable { onViewAllReports() }
+                            ) {
+                                Text(
+                                    text = "See All",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF16A34A)
+                                )
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                    contentDescription = null,
+                                    tint = Color(0xFF16A34A),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                         }
 
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            actionGridList.chunked(3).forEach { rowItems ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    rowItems.forEach { item ->
+                                        QuickActionCard(
+                                            item = item,
+                                            onClick = { onSelectGridFeature(item.title) },
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    }
+                                    repeat(3 - rowItems.size) { Spacer(modifier = Modifier.weight(1f)) }
+                                }
+                            }
+                        }
+                    }
+
+                    // RECENT REPORTS SECTION
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Text(
-                            text = latestReport.title,
+                            text = "Recent Reports",
                             fontSize = 16.sp,
                             fontWeight = FontWeight.Bold,
-                            color = EcoTextDark
+                            color = Color(0xFF1E293B)
                         )
-
-                        Text(
-                            text = "📍 ${latestReport.barangay}, Cagayan de Oro City",
-                            fontSize = 12.sp,
-                            color = EcoTextMuted
-                        )
-
-                        MapPreviewBox(
-                            heightDp = 100,
-                            locationName = "${latestReport.barangay}, Cagayan de Oro City",
-                            gpsCoordinates = latestReport.gpsCoordinates
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { onViewAllReports() }
+                        ) {
+                            Text(
+                                text = "View All",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF16A34A)
+                            )
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = null,
+                                tint = Color(0xFF16A34A),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
-                }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                    // RECENT REPORT CARD
+                    val latestReport = reports.maxByOrNull { reportDateTimestamp(it.date) }
+                    if (latestReport == null) {
+                        Text(
+                            text = "No reports submitted yet. Use the camera button to create your first report.",
+                            fontSize = 13.sp,
+                            color = EcoTextMuted,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp)
+                        )
+                    } else {
+                        Card(
+                            onClick = { onSelectReport(latestReport) },
+                            shape = RoundedCornerShape(20.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE2E8F0)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    color = Color(0xFFFEF08A),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text(
+                                        text = latestReport.status.uppercase().replace('_', ' '),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = Color(0xFF854D0E),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                    )
+                                }
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.CalendarToday,
+                                        contentDescription = null,
+                                        tint = Color(0xFF64748B),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = latestReport.date,
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF64748B)
+                                    )
+                                }
+                            }
+
+                            Text(
+                                text = latestReport.title,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color(0xFF1E293B)
+                            )
+
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.LocationOn,
+                                    contentDescription = null,
+                                    tint = Color(0xFFEF4444),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = latestReport.barangay.ifBlank { latestReport.title },
+                                    fontSize = 12.sp,
+                                    color = Color(0xFF64748B)
+                                )
+                            }
+
+                            MapPreviewBox(
+                                heightDp = 210,
+                                locationName = latestReport.title,
+                                gpsCoordinates = latestReport.gpsCoordinates
+                            )
+                        }
+                    }
+                    }
+
+                    Spacer(modifier = Modifier.height(20.dp))
+                }
             }
         }
     }
@@ -1170,7 +1479,7 @@ fun NewWasteReportScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFFF8FAFC))
+            .background(MaterialTheme.colorScheme.background)
     ) {
         Surface(
             color = Color.White,
@@ -1498,18 +1807,22 @@ fun NewWasteReportScreen(
                         )
 
                         // Save permanently to local disk storage & MongoDB database
-                        CityCareApiService.addLocalReport(context, newReport)
+                        CityCareApiService.addLocalReport(
+                            context,
+                            newReport,
+                            enqueueUpload = false
+                        )
                         coroutineScope.launch {
                             val synced = CityCareApiService.syncPendingReport(context, newReport)
                             val message = if (synced) {
                                 "Report submitted to CLENRO."
                             } else {
-                                "Report saved on this device; upload will retry when connected."
+                                CityCareApiService.enqueuePendingReportUpload(context)
+                                "Report saved on this device; upload will retry when internet is available."
                             }
                             Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                         }
 
-                        Toast.makeText(context, "Report saved. Connecting to CLENRO...", Toast.LENGTH_SHORT).show()
                         onSubmit(newReport)
                     },
                     modifier = Modifier
@@ -1567,14 +1880,27 @@ private suspend fun fetchRealDeviceLocation(
     val locationClient =
         com.google.android.gms.location.LocationServices.getFusedLocationProviderClient(context)
     val location = try {
-        com.google.android.gms.tasks.Tasks.await(
-            locationClient.getCurrentLocation(
-                com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY,
-                com.google.android.gms.tasks.CancellationTokenSource().token
-            ),
-            30,
-            TimeUnit.SECONDS
-        )
+        withTimeout(30_000L) {
+            suspendCancellableCoroutine<android.location.Location?> { continuation ->
+                val cancellationTokenSource =
+                    com.google.android.gms.tasks.CancellationTokenSource()
+                continuation.invokeOnCancellation { cancellationTokenSource.cancel() }
+                try {
+                    locationClient.getCurrentLocation(
+                        com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY,
+                        cancellationTokenSource.token
+                    )
+                        .addOnSuccessListener { result ->
+                            continuation.resumeWith(Result.success(result))
+                        }
+                        .addOnFailureListener { error ->
+                            continuation.resumeWith(Result.failure(error))
+                        }
+                } catch (e: SecurityException) {
+                    continuation.resumeWith(Result.failure(e))
+                }
+            }
+        }
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
@@ -1627,6 +1953,7 @@ private suspend fun fetchRealDeviceLocation(
 fun MyReportsScreenContent(
     reports: List<WasteReportItem>,
     initialStatusFilter: String = "ALL",
+    onStatusFilterChanged: (String) -> Unit = {},
     onOpenProfile: () -> Unit,
     onSelectReport: (WasteReportItem) -> Unit
 ) {
@@ -1642,48 +1969,33 @@ fun MyReportsScreenContent(
         }
         val matchesSearch = report.title.contains(searchQuery, ignoreCase = true) ||
                 report.id.contains(searchQuery, ignoreCase = true)
-        val matchesUser = report.userEmail.isEmpty() || report.userEmail.equals(CityCareApiService.currentUserEmail, ignoreCase = true)
+        val matchesUser = report.userEmail.isNotBlank() &&
+            report.userEmail.equals(CityCareApiService.currentUserEmail, ignoreCase = true)
         matchesStatus && matchesSearch && matchesUser
     }
 
     LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 18.dp),
+        modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Spacer(modifier = Modifier.height(20.dp))
-
-            // Standard Top Header Bar with Safe Clearance
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "My Reports",
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = EcoTextDark
-                )
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
+            EcoPageHeader(
+                title = "My Reports",
+                subtitle = "Track and manage your submitted reports",
+                trailingContent = {
                     UserProfileAvatarComposable(
-                        modifier = Modifier.size(36.dp),
+                        modifier = Modifier.size(40.dp),
                         onClick = onOpenProfile
                     )
-
                 }
-            }
+            )
         }
 
         item {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1722,27 +2034,27 @@ fun MyReportsScreenContent(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .padding(horizontal = 18.dp)
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 listOf("ALL", "PENDING", "ASSIGNED", "IN_PROGRESS", "DONE", "REJECTED").forEach { filter ->
                     val isSelected = selectedFilter == filter
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.clickable { selectedFilter = filter }
+                    Surface(
+                        onClick = {
+                            selectedFilter = filter
+                            onStatusFilterChanged(filter)
+                        },
+                        shape = RoundedCornerShape(18.dp),
+                        color = if (isSelected) EcoPrimaryGreen else Color.White,
+                        border = if (isSelected) null else androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder)
                     ) {
                         Text(
                             text = if (filter == "ALL") filter else filter.replace('_', ' '),
-                            fontSize = 11.sp,
-                            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold,
-                            color = if (isSelected) EcoPrimaryGreen else EcoTextMuted
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Box(
-                            modifier = Modifier
-                                .width(28.dp)
-                                .height(2.dp)
-                                .background(if (isSelected) EcoPrimaryGreen else Color.Transparent)
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isSelected) Color.White else EcoTextMuted,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                         )
                     }
                 }
@@ -1755,7 +2067,9 @@ fun MyReportsScreenContent(
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
                 border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp)
             ) {
                 Row(
                     modifier = Modifier.padding(12.dp),
@@ -1796,11 +2110,36 @@ fun MyReportsScreenContent(
                             overflow = TextOverflow.Ellipsis
                         )
 
-                        Text(
-                            text = "🕒 ${report.date}",
-                            fontSize = 10.sp,
-                            color = EcoTextMuted
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.LocationOn,
+                                contentDescription = null,
+                                tint = EcoPrimaryGreen,
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = report.barangay.ifBlank { "Location unavailable" },
+                                fontSize = 10.sp,
+                                color = EcoTextMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.AccessTime,
+                                contentDescription = null,
+                                tint = EcoTextMuted,
+                                modifier = Modifier.size(11.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = report.date,
+                                fontSize = 10.sp,
+                                color = EcoTextMuted
+                            )
+                        }
                     }
                 }
             }
@@ -1816,6 +2155,7 @@ fun MyReportsScreenContent(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
+                        .padding(horizontal = 18.dp)
                         .padding(vertical = 32.dp),
                     color = EcoTextMuted,
                     fontSize = 13.sp,
@@ -1833,6 +2173,7 @@ fun MyReportsScreenContent(
 // -----------------------------------------------------------------------------
 @Composable
 fun SupportScreenContent(
+    reports: List<WasteReportItem> = emptyList(),
     onBack: () -> Unit = {},
     onOpenNotifications: () -> Unit = {},
     onSelectReport: (WasteReportItem) -> Unit = {}
@@ -2063,52 +2404,52 @@ fun SupportScreenContent(
             }
         }
 
-        item {
-            Card(
-                onClick = {
-                    onSelectReport(
-                        WasteReportItem(
-                            id = "#CDO-2026-0412",
-                            title = "Bin Not Collected on Time",
-                            barangay = "Carmen",
-                            date = "Today, 8:45 AM",
-                            status = "PENDING",
-                            description = "Missed pickup for household waste."
-                        )
-                    )
-                },
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 14.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+        if (reports.isEmpty()) {
+            item {
+                Text(
+                    text = "No complaints submitted yet.",
+                    fontSize = 13.sp,
+                    color = EcoTextMuted,
+                    modifier = Modifier.padding(vertical = 8.dp)
+                )
+            }
+        } else {
+            items(reports) { report ->
+                Card(
+                    onClick = { onSelectReport(report) },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(
-                            text = "Bin Not Collected on Time",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = EcoTextDark
-                        )
-                        Text(
-                            text = "Missed Pickup",
-                            fontSize = 11.sp,
-                            color = EcoTextMuted
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = report.title,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = EcoTextDark
+                            )
+                            Text(
+                                text = "${report.category} · ${report.status.replace('_', ' ')}",
+                                fontSize = 11.sp,
+                                color = EcoTextMuted
+                            )
+                        }
+
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
+                            tint = EcoTextDark,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
-
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                        contentDescription = null,
-                        tint = EcoTextDark,
-                        modifier = Modifier.size(20.dp)
-                    )
                 }
             }
         }
@@ -2124,61 +2465,109 @@ fun SupportScreenContent(
 fun MoreScreenContent(
     onOpenProfile: () -> Unit = {},
     onOpenSupport: () -> Unit = {},
+    onOpenActivityHistory: () -> Unit = {},
     onOpenItem: (String) -> Unit = {}
 ) {
+    val context = LocalContext.current
+    val appVersion = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "1.0.1"
+    }
     val moreItems = listOf(
-        "Profile",
-        "Support",
-        "Privacy Settings",
-        "Payment Methods",
-        "Legal Information"
+        "Profile" to Icons.Outlined.Person,
+        "Support" to Icons.AutoMirrored.Outlined.HelpOutline,
+        "Activity History" to Icons.Outlined.History,
+        "Notification Settings" to Icons.Outlined.Notifications,
+        "App Settings" to Icons.Outlined.Settings,
+        "About Us" to Icons.Outlined.Info,
+        "Legal Information" to Icons.Outlined.Description
     )
 
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+            .background(Color(0xFFF8FAFC)),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(bottom = 20.dp)
     ) {
         item {
-            Spacer(modifier = Modifier.height(14.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFF8FAFC))
+                    .padding(start = 24.dp, top = 20.dp, end = 24.dp, bottom = 12.dp)
+            ) {
+                Text(
+                    text = "More",
+                    fontSize = 21.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = EcoTextDark
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Settings and other options",
+                    fontSize = 14.sp,
+                    color = EcoTextMuted
+                )
+            }
         }
 
-        items(moreItems) { title ->
+        items(moreItems) { (title, icon) ->
             Card(
                 onClick = {
-                    if (title == "Profile") {
-                        onOpenProfile()
-                    } else if (title == "Support") {
-                        onOpenSupport()
-                    } else {
-                        onOpenItem(title)
+                    when (title) {
+                        "Profile" -> onOpenProfile()
+                        "Support" -> onOpenSupport()
+                        "Activity History" -> onOpenActivityHistory()
+                        else -> onOpenItem(title)
                     }
                 },
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
-                border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                modifier = Modifier.fillMaxWidth()
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE2E8F0)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
             ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                        .padding(horizontal = 12.dp, vertical = 12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = title,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = EcoTextDark
-                    )
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0xFFE5F2E8)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = null,
+                                tint = Color(0xFF1E7A38),
+                                modifier = Modifier.size(19.dp)
+                            )
+                        }
+                        Text(
+                            text = title,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = EcoTextDark
+                        )
+                    }
 
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                         contentDescription = null,
-                        tint = EcoTextDark,
-                        modifier = Modifier.size(20.dp)
+                        tint = EcoTextMuted,
+                        modifier = Modifier.size(22.dp)
                     )
                 }
             }
@@ -2186,15 +2575,17 @@ fun MoreScreenContent(
 
         item {
             Card(
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
-                border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                modifier = Modifier.fillMaxWidth()
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE2E8F0)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
             ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                        .padding(horizontal = 14.dp, vertical = 14.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -2202,11 +2593,11 @@ fun MoreScreenContent(
                         text = "App Version",
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Medium,
-                        color = EcoTextDark
+                        color = EcoTextMuted
                     )
 
                     Text(
-                        text = "1.0.1",
+                        text = appVersion,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
                         color = EcoTextDark
@@ -2220,27 +2611,111 @@ fun MoreScreenContent(
 }
 
 @Composable
+private fun ServerConnectionSettingsCard() {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    var apiUrl by remember { mutableStateOf(CityCareApiService.BASE_URL) }
+    var isChecking by remember { mutableStateOf(false) }
+    var connectionMessage by remember { mutableStateOf("") }
+    var connectionSucceeded by remember { mutableStateOf<Boolean?>(null) }
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "CityCare API address",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = EcoTextDark
+            )
+            Text(
+                text = "Use the computer's current Wi-Fi IPv4 address. The phone and computer must be on the same Wi-Fi, and the backend must be running.",
+                fontSize = 12.sp,
+                color = EcoTextMuted
+            )
+            OutlinedTextField(
+                value = apiUrl,
+                onValueChange = { apiUrl = it },
+                label = { Text("API URL") },
+                placeholder = { Text("http://192.168.1.20:5000/api") },
+                singleLine = true,
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    keyboardType = androidx.compose.ui.text.input.KeyboardType.Uri
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Button(
+                enabled = !isChecking,
+                onClick = {
+                    val saved = CityCareApiService.saveApiBaseUrl(context, apiUrl)
+                    if (!saved.first) {
+                        connectionSucceeded = false
+                        connectionMessage = saved.second
+                    } else {
+                        apiUrl = CityCareApiService.BASE_URL
+                        isChecking = true
+                        connectionSucceeded = null
+                        connectionMessage = "Checking API and database..."
+                        coroutineScope.launch {
+                            val result = CityCareApiService.checkApiConnection()
+                            connectionSucceeded = result.first
+                            connectionMessage = result.second
+                            isChecking = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = EcoPrimaryGreen)
+            ) {
+                Text(if (isChecking) "Checking..." else "Save & Test Connection")
+            }
+            if (connectionMessage.isNotBlank()) {
+                Text(
+                    text = connectionMessage,
+                    fontSize = 12.sp,
+                    color = if (connectionSucceeded == true) EcoPrimaryGreen else
+                        if (connectionSucceeded == false) Color(0xFFB91C1C) else EcoTextMuted
+                )
+            }
+        }
+    }
+}
+
+@Composable
 @OptIn(ExperimentalMaterial3Api::class)
 fun MoreSettingsDetailScreen(
     title: String,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
+    val preferences = remember {
+        context.getSharedPreferences("citycare_profile_preferences", Context.MODE_PRIVATE)
+    }
+    var collectionNotificationsEnabled by remember(title) {
+        mutableStateOf(preferences.getBoolean("collection_notifications", true))
+    }
+    var reportNotificationsEnabled by remember(title) {
+        mutableStateOf(preferences.getBoolean("report_notifications", true))
+    }
     val details = remember(title) {
         when (title) {
-            "Privacy Settings" -> listOf(
-                "Profile visibility is set to Private",
-                "Location access is used only for service matching",
-                "Personal data is used to improve city waste alerts"
-            )
-            "Payment Methods" -> listOf(
-                "No active payment method linked yet",
-                "Wallet balance: Php 0.00",
-                "Payment setup can be completed under billing settings"
+            "About Us" -> listOf(
+                "CityCare CDO connects residents with local waste collection and community services.",
+                "Use the app to report waste concerns, follow report progress, view collection schedules, and discover recycling resources."
             )
             "Legal Information" -> listOf(
-                "Terms of service updated for 2026",
-                "Privacy policy is available in the app help center",
-                "Data handling follows local digital service standards"
+                "Use CityCare respectfully and submit accurate information when reporting community concerns.",
+                "Profile and report information is used to provide CityCare services and respond to submitted reports.",
+                "Do not submit another person's private information without permission."
             )
             else -> emptyList()
         }
@@ -2248,15 +2723,17 @@ fun MoreSettingsDetailScreen(
 
     val summary = remember(title) {
         when (title) {
-            "Privacy Settings" -> "Manage your profile visibility, data sharing, and account protection."
-            "Payment Methods" -> "Review all your saved billing and payment preferences."
+            "Notification Settings" -> "Choose which CityCare updates you want to receive."
+            "App Settings" -> "Manage app connection and notification preferences."
+            "About Us" -> "About CityCare CDO."
             "Legal Information" -> "Read the policies and legal guidance for using CityCare."
+            "Server Connection" -> "Connect this phone to the computer running the CityCare API on the same Wi-Fi network."
             else -> "View your CityCare account settings."
         }
     }
 
     Surface(
-        color = Color(0xFFF8FAFC),
+        color = MaterialTheme.colorScheme.background,
         modifier = Modifier.fillMaxSize()
     ) {
         Column(
@@ -2285,59 +2762,94 @@ fun MoreSettingsDetailScreen(
                     .padding(horizontal = 18.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                item {
-                    Card(
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp)
+                if (title == "App Settings") {
+                    item {
+                        ServerConnectionSettingsCard()
+                    }
+                    item {
+                        MoreNotificationPreferencesCard(
+                            collectionEnabled = collectionNotificationsEnabled,
+                            onCollectionChanged = {
+                                collectionNotificationsEnabled = it
+                                preferences.edit().putBoolean("collection_notifications", it).apply()
+                            },
+                            reportsEnabled = reportNotificationsEnabled,
+                            onReportsChanged = {
+                                reportNotificationsEnabled = it
+                                preferences.edit().putBoolean("report_notifications", it).apply()
+                            }
+                        )
+                    }
+                } else if (title == "Notification Settings") {
+                    item {
+                        MoreNotificationPreferencesCard(
+                            collectionEnabled = collectionNotificationsEnabled,
+                            onCollectionChanged = {
+                                collectionNotificationsEnabled = it
+                                preferences.edit().putBoolean("collection_notifications", it).apply()
+                            },
+                            reportsEnabled = reportNotificationsEnabled,
+                            onReportsChanged = {
+                                reportNotificationsEnabled = it
+                                preferences.edit().putBoolean("report_notifications", it).apply()
+                            }
+                        )
+                    }
+                } else {
+                    item {
+                        Card(
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder)
                         ) {
-                            Text(
-                                text = title,
-                                fontSize = 20.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = EcoTextDark
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = summary,
-                                fontSize = 13.sp,
-                                color = EcoTextMuted
-                            )
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(16.dp)
+                            ) {
+                                Text(
+                                    text = title,
+                                    fontSize = 20.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = EcoTextDark
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = summary,
+                                    fontSize = 13.sp,
+                                    color = EcoTextMuted
+                                )
+                            }
                         }
                     }
-                }
 
-                items(details) { detail ->
-                    Card(
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                    items(details) { detail ->
+                        Card(
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder),
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = null,
-                                tint = EcoPrimaryGreen,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Text(
-                                text = detail,
-                                fontSize = 13.sp,
-                                color = EcoTextDark,
-                                modifier = Modifier.weight(1f)
-                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.CheckCircle,
+                                    contentDescription = null,
+                                    tint = EcoPrimaryGreen,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Text(
+                                    text = detail,
+                                    fontSize = 13.sp,
+                                    color = EcoTextDark,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                         }
                     }
                 }
@@ -2351,6 +2863,48 @@ fun MoreSettingsDetailScreen(
                         Text("Back to More")
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MoreNotificationPreferencesCard(
+    collectionEnabled: Boolean,
+    onCollectionChanged: (Boolean) -> Unit,
+    reportsEnabled: Boolean,
+    onReportsChanged: (Boolean) -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        border = androidx.compose.foundation.BorderStroke(1.dp, EcoCardBorder)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Report updates", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = EcoTextDark)
+                    Text("Assigned, in-progress, resolved, and rejected reports", fontSize = 12.sp, color = EcoTextMuted)
+                }
+                Switch(checked = reportsEnabled, onCheckedChange = onReportsChanged)
+            }
+            HorizontalDivider(color = EcoCardBorder)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Community updates", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = EcoTextDark)
+                    Text("Collection schedules, recycling, events, tips, and blogs", fontSize = 12.sp, color = EcoTextMuted)
+                }
+                Switch(checked = collectionEnabled, onCheckedChange = onCollectionChanged)
             }
         }
     }
@@ -2377,7 +2931,7 @@ fun TicketDetailsScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFFF8FAFC))
+            .background(MaterialTheme.colorScheme.background)
     ) {
         Surface(
             color = Color.White,
@@ -2506,8 +3060,8 @@ fun TicketDetailsScreen(
                 ) {
                     Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         MapPreviewBox(
-                            heightDp = 110,
-                            locationName = "${report.barangay}, Cagayan de Oro",
+                            heightDp = 220,
+                            locationName = report.title,
                             gpsCoordinates = report.gpsCoordinates
                         )
 
@@ -2798,7 +3352,7 @@ fun CollectionScheduleScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFFF8FAFC))
+            .background(MaterialTheme.colorScheme.background)
     ) {
         Surface(
             color = Color.White,
@@ -2912,7 +3466,7 @@ fun CollectionScheduleScreen(
                                     Column(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .background(Color(0xFFF8FAFC), RoundedCornerShape(10.dp))
+                                            .background(MaterialTheme.colorScheme.background, RoundedCornerShape(10.dp))
                                             .padding(12.dp),
                                         verticalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
@@ -2991,132 +3545,161 @@ private fun CollectionScheduleDetail(
 
 @Composable
 fun NotificationsScreen(
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onUnreadCountChanged: (Int) -> Unit = {}
 ) {
+    var notifications by remember { mutableStateOf<List<CityCareNotification>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+    var refreshKey by remember { mutableIntStateOf(0) }
+    var actionError by remember { mutableStateOf<String?>(null) }
+    val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(CityCareApiService.currentUserEmail, CityCareApiService.authToken, refreshKey) {
+        isLoading = true
+        loadError = null
+        try {
+            notifications = CityCareApiService.fetchNotificationsFromCloud()
+            onUnreadCountChanged(notifications.count { !it.isRead })
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            loadError = error.message ?: "Could not load your notifications."
+        }
+        isLoading = false
+    }
+
+    fun markRead(notification: CityCareNotification) {
+        if (notification.isRead || notification.id.isBlank()) return
+        coroutineScope.launch {
+            try {
+                CityCareApiService.markNotificationRead(notification.id)
+                notifications = notifications.map {
+                    if (it.id == notification.id) it.copy(isRead = true) else it
+                }
+                onUnreadCountChanged(notifications.count { !it.isRead })
+                actionError = null
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                actionError = error.message ?: "Could not mark the notification as read."
+            }
+        }
+    }
+
+    fun markAllRead() {
+        coroutineScope.launch {
+            try {
+                CityCareApiService.markAllNotificationsRead()
+                notifications = notifications.map { it.copy(isRead = true) }
+                onUnreadCountChanged(0)
+                actionError = null
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                actionError = error.message ?: "Could not mark notifications as read."
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFFF8FAFC))
+            .background(MaterialTheme.colorScheme.background)
     ) {
-        Surface(
-            color = Color.White,
-            shadowElevation = 2.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onBack) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = EcoTextDark
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Notifications",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = EcoPrimaryGreen
-                    )
-                }
+        EcoPageHeader(
+            title = "Notifications",
+            subtitle = "Your report and community updates",
+            onBack = onBack
+        )
 
-                Surface(
-                    color = EcoPrimaryGreen,
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text(
-                        text = "2 New",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                    )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.background)
+                .padding(start = 20.dp, end = 12.dp, top = 12.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val unreadCount = notifications.count { !it.isRead }
+            Text(
+                text = if (unreadCount == 0) "You're all caught up" else "$unreadCount unread",
+                modifier = Modifier.weight(1f),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = EcoTextDark
+            )
+            if (unreadCount > 0) {
+                TextButton(onClick = ::markAllRead) {
+                    Text("Mark all read", color = EcoPrimaryGreen, fontSize = 12.sp)
                 }
             }
+        }
+        actionError?.let { message ->
+            Text(
+                text = message,
+                color = MaterialTheme.colorScheme.error,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+            )
         }
 
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 18.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(top = 12.dp, bottom = 20.dp)
         ) {
-            item { Spacer(modifier = Modifier.height(10.dp)) }
-
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("RECENT", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = EcoTextMuted)
-                    Text("Mark all as read", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = EcoPrimaryGreen)
+            if (isLoading) {
+                item {
+                    CircularProgressIndicator(
+                        modifier = Modifier.padding(24.dp),
+                        color = EcoPrimaryGreen
+                    )
                 }
-            }
-
-            item {
-                NotificationCardItem(
-                    title = "Your report #CDO-0412 in Zone 3 Carmen was marked RESOLVED.",
-                    time = "10 mins ago",
-                    icon = Icons.Default.CheckCircle,
-                    iconBg = Color(0xFFDCFCE7),
-                    iconColor = Color(0xFF166534),
-                    borderColor = Color(0xFF22C55E)
-                )
-            }
-
-            item {
-                NotificationCardItem(
-                    title = "CLENRO dispatched Truck #4 to your reported location in Lapasan.",
-                    time = "2 hours ago",
-                    icon = Icons.Default.LocalShipping,
-                    iconBg = Color(0xFFDBEAFE),
-                    iconColor = Color(0xFF1E40AF),
-                    borderColor = Color(0xFF0284C7)
-                )
-            }
-
-            item {
-                NotificationCardItem(
-                    title = "Reminder: Schedule change for waste collection in Barangay Macasandig this holiday weekend.",
-                    time = "Yesterday, 08:00 AM",
-                    icon = Icons.AutoMirrored.Filled.VolumeUp,
-                    iconBg = Color(0xFFE0EBFF),
-                    iconColor = Color(0xFF2563EB),
-                    borderColor = Color.Transparent
-                )
-            }
-
-            item {
-                NotificationCardItem(
-                    title = "Report #CDO-0401 collection is delayed due to heavy traffic on CM Recto Avenue.",
-                    time = "Yesterday, 02:30 PM",
-                    icon = Icons.Default.Warning,
-                    iconBg = Color(0xFFFEF08A),
-                    iconColor = Color(0xFF854D0E),
-                    borderColor = Color.Transparent
-                )
-            }
-
-            item {
-                OutlinedButton(
-                    onClick = { },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(44.dp),
-                    shape = RoundedCornerShape(22.dp)
-                ) {
-                    Text("Load More Older Notifications", fontSize = 12.sp, color = EcoPrimaryGreen)
+            } else if (loadError != null) {
+                item {
+                    Text(
+                        text = loadError.orEmpty(),
+                        color = MaterialTheme.colorScheme.error,
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp)
+                    )
                 }
-
-                Spacer(modifier = Modifier.height(24.dp))
+            } else if (notifications.isEmpty()) {
+                item {
+                    Text(
+                        text = "No notifications yet. Report status changes, collection schedule updates, and new community posts will appear here.",
+                        color = EcoTextMuted,
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 24.dp, vertical = 36.dp)
+                    )
+                }
+            } else {
+                itemsIndexed(
+                    items = notifications,
+                    key = { index, notification ->
+                        "${notification.id.ifBlank { "notification" }}-$index"
+                    }
+                ) { _, notification ->
+                    NotificationCardItem(
+                        title = notification.title,
+                        body = notification.body,
+                        time = formatNotificationTimestamp(notification.time),
+                        isRead = notification.isRead,
+                        onClick = { markRead(notification) },
+                        icon = Icons.Default.Notifications,
+                        iconBg = if (notification.isRead) Color(0xFFE0F2FE) else Color(0xFFDCFCE7),
+                        iconColor = if (notification.isRead) Color(0xFF0369A1) else EcoPrimaryGreen,
+                        borderColor = if (notification.isRead) EcoCardBorder else Color(0xFF86C99C)
+                    )
+                }
             }
         }
     }
@@ -3164,7 +3747,7 @@ fun TipsScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.White)
+            .background(MaterialTheme.colorScheme.background)
     ) {
         Surface(
             color = Color.White,
@@ -3454,39 +4037,15 @@ fun ProfileScreenContent(
         }
     }
 
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
         item {
             Spacer(modifier = Modifier.height(16.dp))
-
-            // Header Row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onBack) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = EcoPrimaryGreen
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "User Profile",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = EcoPrimaryGreen
-                    )
-                }
-
-            }
         }
 
         // Profile Main Card
@@ -3507,7 +4066,7 @@ fun ProfileScreenContent(
                             .fillMaxWidth()
                             .height(130.dp)
                             .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
-                            .background(Color(0xFFE2E8F0))
+                            .background(EcoHeaderDark)
                             .clickable { showCoverPicker = true }
                     ) {
                         if (coverBitmap != null) {
@@ -3521,11 +4080,15 @@ fun ProfileScreenContent(
                             Canvas(modifier = Modifier.fillMaxSize()) {
                                 val w = size.width
                                 val h = size.height
-                                drawRect(color = Color(0xFFE8E5DA))
-                                drawCircle(color = Color(0xFF90A997).copy(alpha = 0.85f), radius = h * 0.95f, center = Offset(w * 0.25f, h * 0.5f))
-                                drawCircle(color = Color(0xFFB3C5B7).copy(alpha = 0.65f), radius = h * 0.75f, center = Offset(w * 0.35f, h * 0.3f))
-                                drawCircle(color = Color(0xFFD3DEC8).copy(alpha = 0.75f), radius = h * 0.85f, center = Offset(w * 0.85f, h * 0.6f))
-                                drawCircle(color = Color(0xFFE1E8D5).copy(alpha = 0.55f), radius = h * 1.15f, center = Offset(w * 0.7f, h * 0.8f))
+                                drawRect(
+                                    brush = Brush.horizontalGradient(
+                                        colors = listOf(EcoHeaderDark, EcoHeaderGradientEnd)
+                                    )
+                                )
+                                drawCircle(color = EcoLimeAccent.copy(alpha = 0.16f), radius = h * 0.95f, center = Offset(w * 0.25f, h * 0.5f))
+                                drawCircle(color = Color(0xFFB6D9A6).copy(alpha = 0.15f), radius = h * 0.75f, center = Offset(w * 0.35f, h * 0.3f))
+                                drawCircle(color = Color(0xFF77B987).copy(alpha = 0.20f), radius = h * 0.85f, center = Offset(w * 0.85f, h * 0.6f))
+                                drawCircle(color = Color(0xFFD3E8C6).copy(alpha = 0.12f), radius = h * 1.15f, center = Offset(w * 0.7f, h * 0.8f))
                             }
                         }
 
@@ -3782,7 +4345,7 @@ fun ProfileScreenContent(
                         )
                         HorizontalDivider(color = Color(0xFFF1F5F9))
                         ProfileMenuRow(
-                            icon = Icons.Outlined.HelpOutline,
+                            icon = Icons.AutoMirrored.Outlined.HelpOutline,
                             title = "Help & FAQ",
                             onClick = { supportDialogTitle = "Help & FAQ" }
                         )
@@ -3805,6 +4368,7 @@ fun ProfileScreenContent(
 
             Spacer(modifier = Modifier.height(20.dp))
         }
+    }
     }
 
     if (showNotificationPreferences) {
@@ -4113,35 +4677,144 @@ fun NavTabItemComposable(
     inactiveIcon: ImageVector,
     isSelected: Boolean,
     onClick: () -> Unit,
+    showUnreadBadge: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Surface(
         modifier = modifier,
         onClick = onClick,
-        color = if (isSelected) EcoHomeTabYellow else Color.Transparent,
-        shape = RoundedCornerShape(16.dp)
+        color = Color.Transparent
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
         ) {
-            Icon(
-                imageVector = if (isSelected) activeIcon else inactiveIcon,
-                contentDescription = label,
-                tint = EcoTextDark,
-                modifier = Modifier.size(20.dp)
-            )
+            Box {
+                Icon(
+                    imageVector = if (isSelected) activeIcon else inactiveIcon,
+                    contentDescription = label,
+                    tint = if (isSelected) EcoPrimaryGreen else EcoTextMuted,
+                    modifier = Modifier.size(24.dp)
+                )
+                if (showUnreadBadge) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .offset(x = 3.dp, y = (-2).dp)
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFDC2626))
+                            .border(1.5.dp, Color.White, CircleShape)
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = label,
-                fontSize = 11.sp,
-                fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
-                color = if (isSelected) EcoTextDark else EcoTextMuted,
+                fontSize = 10.sp,
+                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                color = if (isSelected) EcoPrimaryGreen else EcoTextMuted,
                 maxLines = 1,
                 softWrap = false,
                 textAlign = TextAlign.Center
             )
+            Spacer(modifier = Modifier.height(3.dp))
+            Box(
+                modifier = Modifier
+                    .width(22.dp)
+                    .height(2.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(if (isSelected) EcoPrimaryGreen else Color.Transparent)
+            )
+        }
+    }
+}
+
+@Composable
+private fun EcoPageHeader(
+    title: String,
+    subtitle: String,
+    onBack: (() -> Unit)? = null,
+    trailingContent: (@Composable () -> Unit)? = null
+) {
+    val context = LocalContext.current
+    DisposableEffect(context) {
+        val window = (context as? Activity)?.window
+        if (window != null) {
+            WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false
+        }
+        onDispose {
+            if (window != null) {
+                WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = true
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(184.dp)
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(EcoHeaderDark, EcoHeaderGradientEnd)
+                )
+            )
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            drawCircle(
+                color = Color(0xFF6FB884).copy(alpha = 0.18f),
+                radius = size.height * 0.72f,
+                center = Offset(size.width * 0.96f, size.height * 0.30f)
+            )
+            drawCircle(
+                color = Color(0xFFB6D9A6).copy(alpha = 0.10f),
+                radius = size.height * 0.55f,
+                center = Offset(size.width * 0.88f, size.height * 0.45f)
+            )
+            for (index in 0..5) {
+                val x = size.width * (0.72f + (index % 3) * 0.09f)
+                val y = size.height * (0.52f + (index / 3) * 0.20f)
+                drawOval(
+                    color = Color(0xFFA8D5A2).copy(alpha = 0.18f),
+                    topLeft = Offset(x, y),
+                    size = Size(48f, 19f)
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(start = 16.dp, end = 20.dp, top = 14.dp, bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (onBack != null) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back",
+                        tint = Color.White
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    fontSize = 23.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = subtitle,
+                    fontSize = 12.sp,
+                    color = Color.White.copy(alpha = 0.82f)
+                )
+            }
+            trailingContent?.invoke()
         }
     }
 }
@@ -4447,7 +5120,10 @@ fun TimelineStepItem(
 @Composable
 fun NotificationCardItem(
     title: String,
+    body: String,
     time: String,
+    isRead: Boolean,
+    onClick: () -> Unit,
     icon: ImageVector,
     iconBg: Color,
     iconColor: Color,
@@ -4460,7 +5136,9 @@ fun NotificationCardItem(
             1.dp,
             if (borderColor != Color.Transparent) borderColor else EcoCardBorder
         ),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
     ) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -4488,15 +5166,32 @@ fun NotificationCardItem(
             ) {
                 Text(
                     text = title,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    fontWeight = if (isRead) FontWeight.SemiBold else FontWeight.Bold,
                     color = EcoTextDark,
-                    lineHeight = 16.sp
+                    lineHeight = 19.sp
                 )
+                if (body.isNotBlank()) {
+                    Text(
+                        text = body,
+                        fontSize = 13.sp,
+                        color = EcoTextDark,
+                        lineHeight = 18.sp
+                    )
+                }
                 Text(
                     text = time,
-                    fontSize = 10.sp,
+                    fontSize = 11.sp,
                     color = EcoTextMuted
+                )
+            }
+            if (!isRead) {
+                Box(
+                    modifier = Modifier
+                        .padding(top = 5.dp)
+                        .size(9.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFFDC2626))
                 )
             }
         }

@@ -51,7 +51,7 @@ fun CityCareResetPasswordScreen(
     var timerText by remember { mutableStateOf("01:59") }
 
     Scaffold(
-        containerColor = Color(0xFFF8FAFC),
+        containerColor = MaterialTheme.colorScheme.background,
         contentWindowInsets = WindowInsets.systemBars
     ) { paddingValues ->
         LazyColumn(

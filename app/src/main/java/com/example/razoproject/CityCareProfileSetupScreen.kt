@@ -91,7 +91,7 @@ fun CityCareProfileSetupScreen(
     }
 
     Scaffold(
-        containerColor = Color.White,
+        containerColor = MaterialTheme.colorScheme.background,
         contentWindowInsets = WindowInsets.systemBars
     ) { paddingValues ->
         Column(

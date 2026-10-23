@@ -2,8 +2,13 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const { protect } = require('../middleware/authMiddleware');
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID?.trim() ||
+  '705374451507-oii7ck2c6nduelsjtkpu4240anniqhp7.apps.googleusercontent.com';
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET || 'citycare_super_secret_jwt_key_2026', {
@@ -102,7 +107,7 @@ router.post('/register', async (req, res) => {
 });
 
 // @route   POST /api/auth/login
-// @desc    Authenticate user & get JWT token (Auto-creates account for Google OAuth)
+// @desc    Authenticate a resident using email/phone and password
 // @access  Public
 router.post('/login', async (req, res) => {
   try {
@@ -120,20 +125,7 @@ router.post('/login', async (req, res) => {
       $or: [{ email: cleanId }, { phoneNumber: identifier.trim() }]
     });
 
-    // Auto-create account in MongoDB if user authenticates via Google OAuth
-    if (!user && (password === 'google_oauth_pass' || password.length > 20)) {
-      user = await User.create({
-        fullName: cleanId.includes('@') ? cleanId.split('@')[0] : 'Google User',
-        phoneNumber: `RES-${Date.now()}`,
-        email: cleanId,
-        barangay: 'Carmen',
-        purokZone: 'Zone 3',
-        password,
-        role: 'resident'
-      });
-    }
-
-    const isMatch = user && (user.password === password || password === 'google_oauth_pass' || (await user.matchPassword(password)));
+    const isMatch = user && await user.matchPassword(password);
 
     if (user && isMatch) {
       return res.json({
@@ -163,15 +155,90 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/google', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (typeof idToken !== 'string' || !idToken.trim()) {
+      return res.status(400).json({ success: false, message: 'Google ID token is required.' });
+    }
+
+    let profile;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: idToken.trim(),
+        audience: GOOGLE_CLIENT_ID
+      });
+      profile = ticket.getPayload();
+    } catch {
+      return res.status(401).json({ success: false, message: 'Google ID token is invalid or expired.' });
+    }
+
+    if (!profile?.sub || !profile.email || !profile.email_verified) {
+      return res.status(401).json({ success: false, message: 'Google did not provide a verified email address.' });
+    }
+
+    const email = profile.email.trim().toLowerCase();
+    let user = await User.findOne({ googleId: profile.sub });
+    if (!user) {
+      user = await User.findOne({ email });
+      if (user?.googleId && user.googleId !== profile.sub) {
+        return res.status(409).json({ success: false, message: 'This CityCare account is linked to another Google account.' });
+      }
+    }
+    if (user && user.role !== 'resident') {
+      return res.status(403).json({ success: false, message: 'Google sign-in is only available for resident accounts.' });
+    }
+
+    if (!user) {
+      user = new User({
+        fullName: profile.name || email.split('@')[0],
+        phoneNumber: `GOOG-${profile.sub}`,
+        email,
+        googleId: profile.sub,
+        profilePhoto: profile.picture || '',
+        password: crypto.randomBytes(32).toString('hex'),
+        role: 'resident'
+      });
+    } else {
+      user.googleId = profile.sub;
+      if (!user.profilePhoto && profile.picture) user.profilePhoto = profile.picture;
+    }
+
+    await user.save();
+    return res.json({
+      success: true,
+      message: 'Google sign-in successful.',
+      token: generateToken(user._id),
+      data: {
+        _id: user._id,
+        fullName: user.fullName,
+        phoneNumber: user.phoneNumber,
+        email: user.email,
+        barangay: user.barangay,
+        purokZone: user.purokZone,
+        profilePhoto: user.profilePhoto,
+        role: user.role,
+        ecoPoints: user.ecoPoints
+      }
+    });
+  } catch (error) {
+    console.error('Google Sign-In Error:', error);
+    return res.status(500).json({ success: false, message: 'Google sign-in failed.' });
+  }
+});
+
 router.post('/facebook', async (req, res) => {
   try {
     const { accessToken } = req.body;
-    const appId = process.env.FACEBOOK_APP_ID;
-    const appSecret = process.env.FACEBOOK_APP_SECRET;
-    if (!appId || !appSecret) {
+    const appId = process.env.FACEBOOK_APP_ID?.trim();
+    const appSecret = process.env.FACEBOOK_APP_SECRET?.trim();
+    const hasPlaceholderCredential = [appId, appSecret].some(value =>
+      value && /^(your-|replace-|keep-this-secret|<.*>)|example|placeholder/i.test(value)
+    );
+    if (!appId || !appSecret || hasPlaceholderCredential) {
       return res.status(503).json({
         success: false,
-        message: 'Facebook sign-in is not configured on the server.'
+        message: 'Facebook sign-in is unavailable: set valid FACEBOOK_APP_ID and FACEBOOK_APP_SECRET values in backend/.env, then restart the API server.'
       });
     }
     if (typeof accessToken !== 'string' || !accessToken.trim()) {
@@ -216,6 +283,10 @@ router.post('/facebook', async (req, res) => {
       });
     } else if (!user.facebookId) {
       user.facebookId = profile.id;
+    }
+
+    if (user.role !== 'resident') {
+      return res.status(403).json({ success: false, message: 'Facebook sign-in is only available for resident accounts.' });
     }
 
     await user.save();
